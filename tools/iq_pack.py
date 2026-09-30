@@ -326,7 +326,10 @@ def main() -> int:
     if nvfp4:
         # the GGUF holds the weights without the scale tails, so the engine must not assemble blobs from it
         a.experts_bin = True
-    with open(out / "native_experts.txt", "w", encoding="utf-8", newline="\n") as fo:
+    # written to a temporary name and renamed only when every layer is in: a stop part-way (a layer split across
+    # shards, #171) left a partial native_experts.txt that the next setup run took as a finished pack (#172)
+    tmp = out / "native_experts.txt.tmp"
+    with open(tmp, "w", encoding="utf-8", newline="\n") as fo:
         fo.write("# strata native experts v3: layer gu_type d_type offset blob_bytes gate_off up_off down_off [shard] "
                  "(n_expert %d, total %d; absolute offsets in %s, or in the named shard beside it)\n"
                  % (n_expert, offset, src.name))
@@ -334,6 +337,8 @@ def main() -> int:
             ws = [model.where[t.name] for t in ts]
             if len({w[3] for w in ws}) != 1:
                 print("layer %d: its gate/up/down tensors are in different shards" % l)
+                fo.close()
+                tmp.unlink()
                 return 1
             gg, shard = ws[0][0], ws[0][3]
             if nvfp4:
@@ -342,6 +347,7 @@ def main() -> int:
                 continue
             line = "%d %d %d %d %d %d %d %d" % (l, gt, dt, off, blob, *[gg.data_start + t.offset for t in ts])
             fo.write(line + ("" if shard == src else " " + shard.name) + "\n")
+    tmp.replace(out / "native_experts.txt")
     if a.skip_experts or not a.experts_bin:
         if (out / "experts.bin").exists() and not a.experts_bin:
             print("note: %s/experts.bin exists; the engine reads it instead of the GGUF" % out)
