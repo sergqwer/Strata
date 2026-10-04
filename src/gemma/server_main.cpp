@@ -13,7 +13,7 @@
 // mtmd does it: BOS, then every text part on its own, each image as "<|image>" + its soft tokens + "<image|>".
 //
 //   strata-gemma-server -m model.gguf --mmproj mmproj.gguf [--host 0.0.0.0] [--port 8091] [--api-key-file F]
-//                       [--ctx 4096] [--batch 2048] [--image-tokens 280]
+//                       [--ctx 4096] [--batch 2048] [--image-tokens 280] [--mtp mtp.gguf --draft 3] [--max-queue N]
 #include "strata/gemma/engine.hpp"
 #include "strata/gemma/image.hpp"
 #include "strata/gemma/model.hpp"
@@ -87,6 +87,8 @@ struct Server {
     std::string model_name;
     std::string api_key;
     int ctx = 4096, batch = 2048;
+    int max_queue = 0;                 // > 0: answer 503 "busy" when this many requests are already in (running + waiting)
+    std::atomic<int> inflight{0};
     std::mutex mu;   // one sequence on the GPU at a time
 
     std::vector<llama_token> tokenize(const std::string& text) const {
@@ -365,7 +367,7 @@ void warmup(Server& S) {
 
 int main(int argc, char** argv) {
     std::string model_path, mmproj, host = "127.0.0.1", key_file, mtp_path;
-    int n_draft = 3;
+    int n_draft = 3, max_queue = 0;
     int port = 8091, ctx = 4096, batch = 2048, img_tokens = 280;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -386,6 +388,7 @@ int main(int argc, char** argv) {
         else if (a == "--image-tokens") img_tokens = std::stoi(next());
         else if (a == "--mtp") mtp_path = next();
         else if (a == "--draft") n_draft = std::stoi(next());
+        else if (a == "--max-queue") max_queue = std::stoi(next());
         else {
             std::fprintf(stderr, "unknown argument %s\n", a.c_str());
             return 2;
@@ -398,6 +401,7 @@ int main(int argc, char** argv) {
     Server S;
     S.ctx = ctx;
     S.batch = batch;
+    S.max_queue = max_queue;
     S.model_name = model_path.substr(model_path.find_last_of('/') + 1);
     if (!key_file.empty()) {
         std::ifstream kf(key_file);
@@ -451,10 +455,19 @@ int main(int argc, char** argv) {
     http.Get("/props", [&](const httplib::Request& r, httplib::Response& res) {
         if (!authorized(r)) return send_err(res, 401, "invalid api key");
         res.set_content(json{{"media_marker", S.marker}, {"n_ctx", S.ctx}, {"model", S.model_name},
-                             {"engine", "strata-gemma"}}.dump(), "application/json");
+                             {"engine", "strata-gemma"}, {"inflight", S.inflight.load()}, {"max_queue", S.max_queue}}.dump(),
+                        "application/json");
     });
     http.Post("/completion", [&](const httplib::Request& r, httplib::Response& res) {
         if (!authorized(r)) return send_err(res, 401, "invalid api key");
+        // one sequence at a time: past max_queue the caller is better served elsewhere at once than after a wait
+        struct Slot {
+            std::atomic<int>& n;
+            int v;
+            explicit Slot(std::atomic<int>& a) : n(a), v(++a) {}
+            ~Slot() { --n; }
+        } slot(S.inflight);
+        if (S.max_queue > 0 && slot.v > S.max_queue) return send_err(res, 503, "busy");
         try {
             const json out = completion(S, json::parse(r.body));
             res.set_content(out.dump(), "application/json");
