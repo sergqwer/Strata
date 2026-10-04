@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 
 namespace strata::kernels {
 
@@ -112,4 +113,16 @@ std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out);
 void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y,
                  int n_in, int n_out, int ncols, void* stream);
 
+/// strata-gemma: the MoE experts of a step in one launch. For pair p in [0, n_pairs): y[p] (n_out floats) = expert
+/// ids[p] of the stacked tensor at w_base (expert_bytes apart) times activation column p / x_div of x_q8_1.
+/// Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K.
+void native_mmvq_id(int ggml_type, const void* w_base, std::size_t expert_bytes, const int32_t* ids, int n_pairs,
+                    const void* x_q8_1, int x_div, float* y, int n_in, int n_out, void* stream);
+/// strata-gemma: native_mmvq_id with the pairs grouped by expert (each expert's weights read once for all its
+/// tokens). native_mmvq_group_ids builds the groups (in a native_mmvq_groups_bytes() device buffer) from ids;
+/// native_mmvq_grouped then computes exactly what native_mmvq_id would, bitwise. n_pairs <= 64, <= 8 per expert.
+std::size_t native_mmvq_groups_bytes();
+void native_mmvq_group_ids(const int32_t* ids, int n_pairs, void* groups, void* stream);
+void native_mmvq_grouped(int ggml_type, const void* w_base, std::size_t expert_bytes, const void* groups, int n_pairs,
+                         const void* x_q8_1, int x_div, float* y, int n_in, int n_out, void* stream);
 } // namespace strata::kernels

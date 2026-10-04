@@ -1242,6 +1242,172 @@ void small_f32(const void* weights, const float* x, void* scratch_q8_1,
     small_mmvq<Weight, Qi>(weights, scratch_q8_1, y, n_in, n_out, ncols, stream);
 }
 
+
+// ---- strata-gemma: the MoE experts of a decode / verify step in ONE launch.  blockIdx.y is a (token, expert) pair p:
+// the weights are expert ids[p] of a stacked expert tensor (`expert_bytes` apart) and the activation is column
+// p / x_div of x (x_div = k when every expert of a token reads that token's input, 1 when each pair has its own,
+// as for the down projection).  Same per-row arithmetic as the ncols = 1 multi kernel above.
+template<typename F, int ROWS>
+__launch_bounds__(WARPS * WARP, (ROWS <= 2 ? 4 : 1))
+__global__ void native_mmvq_id_kernel(const uint8_t* __restrict__ w_base, std::size_t expert_bytes,
+                                      const int32_t* __restrict__ ids, const Q81Block* __restrict__ x, int x_div,
+                                      float* __restrict__ y, int n_in, int n_out) {
+    const int p = int(blockIdx.y);
+    const auto* w = reinterpret_cast<const typename F::Block*>(w_base + std::size_t(ids[p]) * expert_bytes);
+    const int x_stride = n_in / Q8K;
+    x += std::size_t(p / x_div) * x_stride;
+    y += std::size_t(p) * n_out;
+    const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
+    const int row0 = ROWS * int(blockIdx.x);
+    const int blocks_per_row = n_in / F::DIV;
+    float tmp[ROWS] = {};
+    for (int kbx = tid / F::T; kbx < blocks_per_row; kbx += F::BPI) {
+        const int kby = kbx * F::KBY;
+        const int kqs = F::kqs(tid);
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) {
+            if (row0 + i < n_out) {
+                const typename F::W wv = F::load(w + std::size_t(row0 + i) * blocks_per_row + kbx, kqs);
+                tmp[i] += F::apply(wv, x + kby, kqs);
+            }
+        }
+    }
+    __shared__ float partial[WARPS - 1][ROWS][WARP];
+    if (threadIdx.y > 0) {
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) partial[threadIdx.y - 1][i][threadIdx.x] = tmp[i];
+    }
+    __syncthreads();
+    if (threadIdx.y > 0) return;
+#pragma unroll
+    for (int i = 0; i < ROWS; ++i) {
+#pragma unroll
+        for (int l = 0; l < WARPS - 1; ++l) tmp[i] += partial[l][i][threadIdx.x];
+        tmp[i] = warp_sum(tmp[i]);
+        if (threadIdx.x == i && row0 + i < n_out) y[row0 + i] = tmp[i];
+    }
+}
+
+// ---- strata-gemma: the same products with the (token, expert) pairs of a verify window grouped by expert, so an
+// expert chosen by several tokens is read once. groups: g -> {expert, count, pairs[8]} (built by mmvq_group_kernel);
+// a block with g >= n_groups exits. Per column the thread layout and the accumulation order are those of
+// native_mmvq_id_kernel, so every output is bitwise equal to it.
+struct IdGroups {
+    int n;
+    int expert[64];
+    int count[64];
+    int pair[64][8];
+};
+// one thread per pair: its group is led by the first pair that chose the same expert; leaders are numbered by a
+// prefix count, members by their rank among the earlier pairs of their expert (the same order as a serial scan)
+__global__ void mmvq_group_kernel(const int32_t* __restrict__ ids, int n_pairs, IdGroups* __restrict__ g) {
+    __shared__ int e[64], lead[64], gidx[64];
+    const int p = threadIdx.x;
+    if (p < n_pairs) e[p] = ids[p];
+    __syncthreads();
+    int first = p, rank = 0;
+    if (p < n_pairs) {
+        for (int q = 0; q < p; ++q)
+            if (e[q] == e[p]) {
+                if (first == p) first = q;
+                ++rank;
+            }
+        lead[p] = first;
+    }
+    __syncthreads();
+    if (p < n_pairs && first == p) {
+        int k = 0;
+        for (int q = 0; q < p; ++q) k += lead[q] == q;
+        gidx[p] = k;
+        g->expert[k] = e[p];
+    }
+    __syncthreads();
+    if (p < n_pairs) {
+        const int k = gidx[first];
+        if (rank < 8) g->pair[k][rank] = p;
+        if (first == p) {
+            int c = 1;
+            for (int q = p + 1; q < n_pairs; ++q) c += e[q] == e[p];
+            g->count[k] = c < 8 ? c : 8;
+        }
+    }
+    if (p == 0) {
+        int n = 0;
+        for (int q = 0; q < n_pairs; ++q) n += lead[q] == q;
+        g->n = n;
+    }
+}
+
+// a warp computes R consecutive output rows of one group's expert (R independent weight streams in flight), for all
+// the group's columns; grid (rows / (8 R), groups), blocks past the group count exit. A row's blocks are split over
+// the 32 lanes as the multi-column kernels split them over a block (kbx = lane / T, kqs(lane)).
+template<typename F, int R>
+__launch_bounds__(256)
+__global__ void native_mmvq_group_kernel(const uint8_t* __restrict__ w_base, std::size_t expert_bytes,
+                                         const IdGroups* __restrict__ groups, const Q81Block* __restrict__ x, int x_div,
+                                         float* __restrict__ y, int n_in, int n_out) {
+    constexpr int BPIW = WARP / F::T;
+    const int lane = int(threadIdx.x) % WARP;
+    const int row0 = (int(blockIdx.x) * 8 + int(threadIdx.x) / WARP) * R;
+    const int gi = int(blockIdx.y);
+    if (row0 >= n_out || gi >= groups->n) return;
+    const int cnt = groups->count[gi];
+    const int x_stride = n_in / Q8K;
+    const int blocks_per_row = n_in / F::DIV;
+    const int kqs = F::kqs(lane);
+    const auto* w = reinterpret_cast<const typename F::Block*>(w_base + std::size_t(groups->expert[gi]) * expert_bytes);
+    const Q81Block* xc[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) xc[j] = x + std::size_t((j < cnt ? groups->pair[gi][j] : 0) / x_div) * x_stride;
+    float acc[R][8] = {};
+    for (int kbx = lane / F::T; kbx < blocks_per_row; kbx += BPIW) {
+        const int kby = kbx * F::KBY;
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            if (row0 + r < n_out) {
+                const typename F::W wv = F::load(w + std::size_t(row0 + r) * blocks_per_row + kbx, kqs);
+#pragma unroll
+                for (int j = 0; j < 8; ++j)
+                    if (j < cnt) acc[r][j] += F::apply(wv, xc[j] + kby, kqs);
+            }
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        if (j >= cnt) break;
+        float* yp = y + std::size_t(groups->pair[gi][j]) * n_out;
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const float v = warp_sum(acc[r][j]);
+            if (lane == 0 && row0 + r < n_out) yp[row0 + r] = v;
+        }
+    }
+}
+
+template<typename F>
+void launch_group(const void* w_base, std::size_t expert_bytes, const IdGroups* groups, int max_groups,
+                  const void* x_q8_1, int x_div, float* y, int n_in, int n_out, cudaStream_t s) {
+    constexpr int R = 1;   // measured: 1 row per warp beats 2 and 4 (parallelism over latency hiding)
+    native_mmvq_group_kernel<F, R><<<dim3{unsigned((n_out + 8 * R - 1) / (8 * R)), unsigned(max_groups)}, 256, 0, s>>>(
+        static_cast<const uint8_t*>(w_base), expert_bytes, groups, static_cast<const Q81Block*>(x_q8_1), x_div, y, n_in,
+        n_out);
+}
+
+template<typename F>
+void launch_id(const void* w_base, std::size_t expert_bytes, const int32_t* ids, int n_pairs, const void* x_q8_1,
+               int x_div, float* y, int n_in, int n_out, cudaStream_t s) {
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    const auto* w = static_cast<const uint8_t*>(w_base);
+    const dim3 threads(WARP, WARPS);
+    if (n_in / F::DIV < F::BPI) {
+        constexpr int ROWS = 2;
+        const dim3 grid(unsigned((std::size_t(n_out) + ROWS - 1) / ROWS), unsigned(n_pairs));
+        native_mmvq_id_kernel<F, ROWS><<<grid, threads, 0, s>>>(w, expert_bytes, ids, x, x_div, y, n_in, n_out);
+    } else {
+        const dim3 grid{unsigned(n_out), unsigned(n_pairs)};
+        native_mmvq_id_kernel<F, 1><<<grid, threads, 0, s>>>(w, expert_bytes, ids, x, x_div, y, n_in, n_out);
+    }
+}
 } // namespace
 
 void native_mmvq_set_multi_exact(bool exact) { g_multi_exact = exact; }
@@ -1614,6 +1780,49 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
         iq_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     default: throw std::invalid_argument("unsupported native MMVQ GGML type");
     }
+}
+
+
+std::size_t native_mmvq_groups_bytes() { return sizeof(IdGroups); }
+
+void native_mmvq_group_ids(const int32_t* ids, int n_pairs, void* groups, void* stream) {
+    if (n_pairs > 64) throw std::invalid_argument("native_mmvq_group_ids: at most 64 pairs");
+    mmvq_group_kernel<<<1, 64, 0, static_cast<cudaStream_t>(stream)>>>(ids, n_pairs, static_cast<IdGroups*>(groups));
+    launch_check();
+}
+
+void native_mmvq_grouped(int ggml_type, const void* w_base, std::size_t expert_bytes, const void* groups, int n_pairs,
+                         const void* x_q8_1, int x_div, float* y, int n_in, int n_out, void* stream) {
+    if (n_pairs <= 0) return;
+    const auto s = static_cast<cudaStream_t>(stream);
+    const auto* g = static_cast<const IdGroups*>(groups);
+    switch (ggml_type) {
+    case 2: launch_group<SmallTraits<Q40Block, 4>>(w_base, expert_bytes, g, n_pairs, x_q8_1, x_div, y, n_in, n_out, s); break;
+    case 6: launch_group<SmallTraits<Q50Block, 4>>(w_base, expert_bytes, g, n_pairs, x_q8_1, x_div, y, n_in, n_out, s); break;
+    case 8: launch_group<SmallTraits<Q80Block, 8>>(w_base, expert_bytes, g, n_pairs, x_q8_1, x_div, y, n_in, n_out, s); break;
+    case 12: launch_group<Q4KTraits>(w_base, expert_bytes, g, n_pairs, x_q8_1, x_div, y, n_in, n_out, s); break;
+    case 13: launch_group<Q5KTraits>(w_base, expert_bytes, g, n_pairs, x_q8_1, x_div, y, n_in, n_out, s); break;
+    case 14: launch_group<Q6KTraits>(w_base, expert_bytes, g, n_pairs, x_q8_1, x_div, y, n_in, n_out, s); break;
+    default: throw std::invalid_argument("native_mmvq_grouped: unsupported GGML type " + std::to_string(ggml_type));
+    }
+    launch_check();
+}
+
+void native_mmvq_id(int ggml_type, const void* w_base, std::size_t expert_bytes, const int32_t* ids, int n_pairs,
+                    const void* x_q8_1, int x_div, float* y, int n_in, int n_out, void* stream) {
+    if (n_pairs <= 0) return;
+    if (x_div < 1) throw std::invalid_argument("native_mmvq_id: x_div must be >= 1");
+    const auto s = static_cast<cudaStream_t>(stream);
+    switch (ggml_type) {
+    case 2: launch_id<SmallTraits<Q40Block, 4>>(w_base, expert_bytes, ids, n_pairs, x_q8_1, x_div, y, n_in, n_out, s); break;
+    case 6: launch_id<SmallTraits<Q50Block, 4>>(w_base, expert_bytes, ids, n_pairs, x_q8_1, x_div, y, n_in, n_out, s); break;
+    case 8: launch_id<SmallTraits<Q80Block, 8>>(w_base, expert_bytes, ids, n_pairs, x_q8_1, x_div, y, n_in, n_out, s); break;
+    case 12: launch_id<Q4KTraits>(w_base, expert_bytes, ids, n_pairs, x_q8_1, x_div, y, n_in, n_out, s); break;
+    case 13: launch_id<Q5KTraits>(w_base, expert_bytes, ids, n_pairs, x_q8_1, x_div, y, n_in, n_out, s); break;
+    case 14: launch_id<Q6KTraits>(w_base, expert_bytes, ids, n_pairs, x_q8_1, x_div, y, n_in, n_out, s); break;
+    default: throw std::invalid_argument("native_mmvq_id: unsupported GGML type " + std::to_string(ggml_type));
+    }
+    launch_check();
 }
 
 } // namespace strata::kernels
