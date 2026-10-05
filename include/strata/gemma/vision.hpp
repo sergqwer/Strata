@@ -34,8 +34,9 @@ public:
     /// Encode one preprocessed image (preprocess() below): returns the number of soft tokens; their
     /// embeddings (n_tokens x n_embd_out floats) are appended to `out`.
     int encode(const ImageU8& img, std::vector<float>& out);
-    /// Decode + resize as llama.cpp does for this model.
-    ImageU8 preprocess(const ImageU8& raw) const;
+    /// Decode + resize as llama.cpp does for this model; with tokens > 0, transformers' resize for that budget
+    /// (preprocess_gemma4_hf: video frames, 70 tokens).
+    ImageU8 preprocess(const ImageU8& raw, int tokens = 0) const;
     int n_embd_out() const { return n_out_; }
     size_t weight_bytes() const { return weight_bytes_; }
     cudaStream_t stream() const { return s_; }

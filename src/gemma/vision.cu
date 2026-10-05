@@ -638,7 +638,8 @@ Vision::~Vision() {
     if (s_) cudaStreamDestroy(s_);
 }
 
-ImageU8 Vision::preprocess(const ImageU8& raw) const {
+ImageU8 Vision::preprocess(const ImageU8& raw, int tokens) const {
+    if (tokens > 0) return preprocess_gemma4_hf(raw, p_->P, p_->merge, tokens);
     return preprocess_gemma4(raw, p_->P, p_->merge, tokens_, tokens_);
 }
 

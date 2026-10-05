@@ -185,4 +185,18 @@ ImageU8 preprocess_gemma4(const ImageU8& img, int patch, int merge, int min_toke
     return dst;
 }
 
+ImageU8 preprocess_gemma4_hf(const ImageU8& img, int patch, int merge, int max_tokens) {
+    const int side = patch * merge;
+    const double total = (double) img.nx * img.ny, target = (double) max_tokens * merge * merge * patch * patch;
+    if (total <= 0) throw std::runtime_error("empty image");
+    const double f = std::sqrt(target / total);
+    int th = (int) std::floor(f * img.ny / side) * side, tw = (int) std::floor(f * img.nx / side) * side;
+    const int max_side = max_tokens * side;  // HF: (max_patches // k^2) * side
+    if (th == 0 && tw == 0) throw std::runtime_error("image too small for the token budget");
+    if (th == 0) { th = side; tw = std::min((img.nx / img.ny) * side, max_side); }
+    else if (tw == 0) { tw = side; th = std::min((img.ny / img.nx) * side, max_side); }
+    if (tw == img.nx && th == img.ny) return img;
+    return resize_pillow(img, tw, th);
+}
+
 }  // namespace strata::gemma

@@ -2,7 +2,9 @@
 // hcap uses, so a client switches by URL:
 //
 //   POST /completion  {"prompt": "<raw prompt>" | {"prompt_string": "...<__media__>...", "multimodal_data": [b64...]},
-//                      "n_predict": 300, "temperature": 0, "json_schema": {...} | "grammar": "<gbnf>"}
+//                      "n_predict": 300, "temperature": 0, "json_schema": {...} | "grammar": "<gbnf>",
+//                      "image_tokens": 70,   (optional: soft tokens per picture, transformers' resize; video frames)
+//                      "max_queue": 2}       (optional: 503 "busy" if this many requests are already in; low priority)
 //                  -> {"content", "tokens_evaluated", "tokens_predicted", "stop", "stop_type", "timings": {...}}
 //   GET  /props    -> {"media_marker", "n_ctx", "model"}
 //   GET  /health   -> {"status": "ok"}
@@ -13,7 +15,9 @@
 // mtmd does it: BOS, then every text part on its own, each image as "<|image>" + its soft tokens + "<image|>".
 //
 //   strata-gemma-server -m model.gguf --mmproj mmproj.gguf [--host 0.0.0.0] [--port 8091] [--api-key-file F]
-//                       [--ctx 4096] [--batch 2048] [--image-tokens 280] [--mtp mtp.gguf --draft 3] [--max-queue N]
+//                       [--ctx 4096] [--batch 2048] [--image-tokens 280] [--max-image-tokens 560]
+//                       [--mtp mtp.gguf --draft 3] [--max-queue N]
+// --max-image-tokens sizes the vision work buffers for the largest per-request "image_tokens" (~90 KB a patch).
 #include "strata/gemma/engine.hpp"
 #include "strata/gemma/image.hpp"
 #include "strata/gemma/model.hpp"
@@ -136,6 +140,11 @@ json completion(Server& S, const json& req) {
     }
     if (req.value("temperature", 0.0) > 0.0) throw std::runtime_error("only greedy decoding (temperature 0) is implemented");
     const int n_predict = std::min(req.value("n_predict", 512), S.ctx);
+    // soft tokens per picture for this request (video frames: 70); 0 = the server's --image-tokens as llama.cpp does
+    const int img_tokens = req.value("image_tokens", 0);
+    if (img_tokens != 0 && img_tokens != 70 && img_tokens != 140 && img_tokens != 280 && img_tokens != 560 &&
+        img_tokens != 1120)
+        throw std::runtime_error("image_tokens must be one of 70, 140, 280, 560, 1120");
     std::string grammar;
     if (req.contains("json_schema") && !req.at("json_schema").is_null())
         grammar = json_schema_to_grammar(common_json::parse(req.at("json_schema").dump()));
@@ -154,7 +163,7 @@ json completion(Server& S, const json& req) {
     const double t_pre = now_ms();
     std::vector<std::future<ImageU8>> pre;
     for (const std::string& m : media)
-        pre.push_back(std::async(std::launch::async, [&S, m]() {
+        pre.push_back(std::async(std::launch::async, [&S, m, img_tokens]() {
             std::string data = m;
             const size_t comma = data.find(',');
             if (data.rfind("data:", 0) == 0 && comma != std::string::npos) data = data.substr(comma + 1);
@@ -162,7 +171,7 @@ json completion(Server& S, const json& req) {
             ImageU8 raw;
             std::string err;
             if (!decode_image(bytes.data(), bytes.size(), raw, err)) throw std::runtime_error(err);
-            return S.vision->preprocess(raw);
+            return S.vision->preprocess(raw, img_tokens);
         }));
     std::vector<ImageU8> images;
     for (auto& f : pre) images.push_back(f.get());
@@ -368,7 +377,7 @@ void warmup(Server& S) {
 int main(int argc, char** argv) {
     std::string model_path, mmproj, host = "127.0.0.1", key_file, mtp_path;
     int n_draft = 3, max_queue = 0;
-    int port = 8091, ctx = 4096, batch = 2048, img_tokens = 280;
+    int port = 8091, ctx = 4096, batch = 2048, img_tokens = 280, max_img_tokens = 280;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() {
@@ -386,6 +395,7 @@ int main(int argc, char** argv) {
         else if (a == "--ctx" || a == "-c") ctx = std::stoi(next());
         else if (a == "--batch" || a == "-b") batch = std::stoi(next());
         else if (a == "--image-tokens") img_tokens = std::stoi(next());
+        else if (a == "--max-image-tokens") max_img_tokens = std::stoi(next());
         else if (a == "--mtp") mtp_path = next();
         else if (a == "--draft") n_draft = std::stoi(next());
         else if (a == "--max-queue") max_queue = std::stoi(next());
@@ -422,7 +432,7 @@ int main(int argc, char** argv) {
         S.vocab = llama_model_get_vocab(S.vocab_model);
         S.model = Model::load(model_path);
         if (!mmproj.empty()) {
-            S.vision.reset(new Vision(mmproj, img_tokens));
+            S.vision.reset(new Vision(mmproj, img_tokens, std::max(4096, max_img_tokens * 9)));  // 3x3 patches a token
             std::fprintf(stderr, "vision: %s, %.2f GiB on the GPU\n", mmproj.c_str(), S.vision->weight_bytes() / 1073741824.0);
         }
         S.engine.reset(new Engine(*S.model, ctx, batch));
@@ -460,16 +470,25 @@ int main(int argc, char** argv) {
     });
     http.Post("/completion", [&](const httplib::Request& r, httplib::Response& res) {
         if (!authorized(r)) return send_err(res, 401, "invalid api key");
-        // one sequence at a time: past max_queue the caller is better served elsewhere at once than after a wait
+        json req;
+        try {
+            req = json::parse(r.body);
+        } catch (const std::exception& e) {
+            return send_err(res, 400, e.what());
+        }
+        // one sequence at a time: past max_queue the caller is better served elsewhere at once than after a wait.
+        // A request may bring a lower limit of its own ("max_queue": 2): a low-priority caller then only gets the
+        // GPU when the queue is short, and never crowds out the others.
         struct Slot {
             std::atomic<int>& n;
             int v;
             explicit Slot(std::atomic<int>& a) : n(a), v(++a) {}
             ~Slot() { --n; }
         } slot(S.inflight);
-        if (S.max_queue > 0 && slot.v > S.max_queue) return send_err(res, 503, "busy");
+        const int own = req.is_object() ? req.value("max_queue", 0) : 0;
+        if ((S.max_queue > 0 && slot.v > S.max_queue) || (own > 0 && slot.v > own)) return send_err(res, 503, "busy");
         try {
-            const json out = completion(S, json::parse(r.body));
+            const json out = completion(S, req);
             res.set_content(out.dump(), "application/json");
         } catch (const std::exception& e) {
             send_err(res, 400, e.what());
