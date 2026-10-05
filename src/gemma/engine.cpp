@@ -48,6 +48,12 @@ void dump(const char* name, int il, const float* dev, int64_t ne0, int64_t ne1, 
 
 }  // namespace
 
+namespace {
+constexpr int kPhases = 8;
+const char* const kPhaseNames[kPhases] = {"qkv", "attention", "attn_out", "dense_mlp", "router_sort", "moe_gate_up",
+                                          "moe_down", "combine_post"};
+}  // namespace
+
 template <class T> T* Engine::carve(size_t count) {
     const size_t off = align256(carve_off_);
     carve_off_ = off + count * sizeof(T);
@@ -257,6 +263,17 @@ void Engine::forward(const Batch& b, Logits mode) {
     n_scored_ = mode == Logits::None ? 0 : 1;
     if (n_scored_) head(n - 1);
     else ck(cudaStreamSynchronize(s_), "forward");
+    if (prof_ && !pev_.empty()) {
+        ck(cudaStreamSynchronize(s_), "profile");
+        const int nb = kPhases + 1;
+        for (int il = 0; il < c.n_layer; ++il)
+            for (int k = 0; k < kPhases; ++k) {
+                float ms = 0;
+                if (cudaEventElapsedTime(&ms, (cudaEvent_t) pev_[(size_t) il * nb + k],
+                                         (cudaEvent_t) pev_[(size_t) il * nb + k + 1]) == cudaSuccess)
+                    ptot_[k] += ms;
+            }
+    }
 }
 
 void Engine::run_small(int n, Logits mode) {
@@ -308,6 +325,7 @@ void Engine::layer_small(int il, int n) {
     a.base = L.rope_base;
     a.eps = c.eps;
     k::qkv_prep(a, s_);
+    mark(il, 1);
     const int32_t* lo = L.swa ? lo_ : lo_ + max_batch_;
     const int32_t* hi = L.swa ? hi_ : hi_ + max_batch_;
     k::attn_partials(q_, kc_[il], vc_[il], lo, hi, att_scratch_, n, L.n_head, L.n_head_kv, L.head_dim, n_split_, s_);
@@ -347,6 +365,29 @@ void Engine::layer_small(int il, int n) {
 
 // ---------------------------------------------------------------------------------------------- a prompt chunk
 
+void Engine::mark(int il, int k) {
+    if (!prof_) return;
+    const int nb = kPhases + 1;
+    if (pev_.empty()) {
+        pev_.resize((size_t) m_.cfg.n_layer * nb);
+        for (auto& e : pev_) {
+            cudaEvent_t ev;
+            ck(cudaEventCreate(&ev), "event");
+            e = ev;
+        }
+        ptot_.assign(kPhases, 0.0);
+    }
+    ck(cudaEventRecord((cudaEvent_t) pev_[(size_t) il * nb + k], s_), "event record");
+}
+
+std::vector<std::pair<const char*, double>> Engine::profile_take() {
+    std::vector<std::pair<const char*, double>> out;
+    if (ptot_.empty()) return out;
+    for (int k = 0; k < kPhases; ++k) out.emplace_back(kPhaseNames[k], ptot_[k]);
+    ptot_.assign(kPhases, 0.0);
+    return out;
+}
+
 void Engine::layer_big(int il, int n) {
     const Config& c = m_.cfg;
     const Layer& L = m_.layers[il];
@@ -372,6 +413,7 @@ void Engine::layer_big(int il, int n) {
         mq->run(p, s_);
     };
 
+    mark(il, 0);
     k::rms_norm(x_, L.attn_norm.f32(), h_, D, n, c.eps, 1.f, s_);
     mmq::quantize(h_, nullptr, xq_, L.wq.type, D, D, n, s_);
     dense(L.wq, xq_, n, q_);
@@ -401,6 +443,7 @@ void Engine::layer_big(int il, int n) {
     a.base = L.rope_base;
     a.eps = c.eps;
     k::qkv_prep(a, s_);
+    mark(il, 1);
 
     // attention through cuBLAS: per kv head g, its rep query heads in one strided batch
     //   S_h [n x T] = Q_h K_g^T, P = masked softmax(S), O_h [n x hd] = P_h V_g
@@ -427,12 +470,14 @@ void Engine::layer_big(int il, int n) {
                                       CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT), "attention");
     }
 
+    mark(il, 2);
     dump("Qcur_pos", il, q_, qd, n, s_);
     dump("kqv_out", il, att_, qd, n, s_);
     mmq::quantize(att_, nullptr, xq_, L.wo.type, qd, qd, n, s_);
     dense(L.wo, xq_, n, y_);
     k::add_rms(x_, y_, L.post_attn_norm.f32(), x1_, D, n, c.eps, s_);
     dump("attn_out", il, x1_, D, n, s_);
+    mark(il, 3);
 
     const bool moe = L.moe();
     k::ffn_norms(x1_, L.ffn_norm.f32(), moe ? L.pre_ffw_norm_2.f32() : nullptr, moe ? L.router_scale.f32() : nullptr,
@@ -444,6 +489,7 @@ void Engine::layer_big(int il, int n) {
     k::geglu(gate_, up_, hid_, n, c.n_ff, c.n_ff, s_);
     mmq::quantize(hid_, nullptr, xq_, L.ffn_down.type, c.n_ff, c.n_ff, n, s_);
     dense(L.ffn_down, xq_, n, mlp_);
+    mark(il, 4);
 
     if (moe) {
         cb(cublasSgemm(hb, CUBLAS_OP_T, CUBLAS_OP_N, E, n, D, &one, L.router.f32(), D, r_, D, &zero, rlog_, E), "router");
@@ -460,6 +506,7 @@ void Engine::layer_big(int il, int n) {
         ck(cudaStreamSynchronize(s_), "bounds");
         int max_rows = 1;
         for (int e = 0; e < E; ++e) max_rows = std::max(max_rows, h_bounds_[e + 1] - h_bounds_[e]);
+        mark(il, 5);
         mmq::Product p;
         p.w = L.gate_up_exps.d;
         p.type = L.gate_up_exps.type;
@@ -475,6 +522,7 @@ void Engine::layer_big(int il, int n) {
         p.dst = gu_;
         p.ld_dst = 2 * FE;
         mq->run(p, s_);
+        mark(il, 6);
         k::geglu(gu_, gu_ + FE, eh_, rows, FE, 2 * FE, s_);
         mmq::quantize(eh_, nullptr, xq_, L.down_exps.type, FE, FE, rows, s_);
         p.w = L.down_exps.d;
@@ -485,12 +533,19 @@ void Engine::layer_big(int il, int n) {
         p.dst = ey_;
         p.ld_dst = D;
         mq->run(p, s_);
+        mark(il, 7);
         k::moe_combine(ey_, inv_, eid_, ew_, L.down_exps_scale ? L.down_exps_scale.f32() : nullptr, moe_, D, n, K, s_);
         dump("moe_raw", il, moe_, D, n, s_);
     }
     dump("mlp_raw", il, mlp_, D, n, s_);
     k::ffn_post(x1_, mlp_, moe ? moe_ : nullptr, moe ? L.post_ffw_norm_1.f32() : nullptr,
                 moe ? L.post_ffw_norm_2.f32() : nullptr, L.post_ffw_norm.f32(), L.out_scale, x_, D, n, c.eps, s_);
+    if (!moe) {  // a dense layer: its MoE phases take no time
+        mark(il, 5);
+        mark(il, 6);
+        mark(il, 7);
+    }
+    mark(il, 8);
 }
 
 // ---------------------------------------------------------------------------------------------- the head

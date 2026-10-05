@@ -58,6 +58,10 @@ public:
     const float* logits_dev() const { return logits_; }
     /// CUDA graphs for the decode path (default on; STRATA_NO_GRAPH=1 turns them off).
     void set_graphs(bool on) { graphs_ = on; }
+    /// Time the prompt path's phases with CUDA events (one forward after another; for diagnosis): milliseconds per
+    /// phase summed over the layers and the forwards since the last profile_take().
+    void set_profile(bool on) { prof_ = on; }
+    std::vector<std::pair<const char*, double>> profile_take();
     cudaStream_t stream() const { return s_; }
     size_t buffer_bytes() const { return buf_bytes_; }
     /// Rows at or below this use the decode path (native_mmvq, flash-decoding); above, the prompt path.
@@ -107,6 +111,10 @@ private:
     std::vector<void*> graph_exec_;   // [n * 3 + mode]: cudaGraphExec_t of run_small
     int n_spans_ = 0;
     size_t xq_bytes_ = 0;
+    bool prof_ = false;
+    std::vector<void*> pev_;          // cudaEvent_t per (layer, phase boundary)
+    std::vector<double> ptot_;        // ms per phase
+    void mark(int il, int k);
 };
 
 }  // namespace strata::gemma

@@ -5,7 +5,8 @@
 //                      "n_predict": 300, "temperature": 0, "json_schema": {...} | "grammar": "<gbnf>",
 //                      "image_tokens": 70,   (optional: soft tokens per picture, transformers' resize; video frames)
 //                      "max_queue": 2,       (optional: 503 "busy" if this many requests are already in; low priority)
-//                      "max_wait_ms": 8000}  (optional: 503 "late" if its turn would / did come later than this)
+//                      "max_wait_ms": 8000,  (optional: 503 "late" if its turn would / did come later than this)
+//                      "wait_until_ms": T}   (optional, the same as a unix-epoch time: the caller's upload counts too)
 // Requests are served in arrival order.
 //                  -> {"content", "tokens_evaluated", "tokens_predicted", "stop", "stop_type", "timings": {...}}
 //   GET  /props    -> {"media_marker", "n_ctx", "model"}
@@ -18,7 +19,7 @@
 //
 //   strata-gemma-server -m model.gguf --mmproj mmproj.gguf [--host 0.0.0.0] [--port 8091] [--api-key-file F]
 //                       [--ctx 4096] [--batch 2048] [--image-tokens 280] [--max-image-tokens 560]
-//                       [--mtp mtp.gguf --draft 3] [--max-queue N]
+//                       [--mtp mtp.gguf --draft 3] [--max-queue N] [--slots N] [--mtp-slots M]
 // --max-image-tokens sizes the vision work buffers for the largest per-request "image_tokens" (~90 KB a patch).
 #include "strata/gemma/engine.hpp"
 #include "strata/gemma/image.hpp"
@@ -84,9 +85,16 @@ std::vector<uint8_t> b64decode(const std::string& in) {
 
 struct Server {
     std::unique_ptr<Model> model;
-    std::unique_ptr<Engine> engine;
+    // --slots N: N engines over the one set of weights, each with its own KV cache, buffers, CUDA stream and graphs.
+    // A request runs whole (prefill + decode) on one free engine; two at once overlap on the GPU - one's decode
+    // (bandwidth-bound) with the other's prefill / vision (compute-bound) - and fill the gaps where a lone sequence
+    // waits on the host (grammar, MTP bookkeeping per token).
+    std::vector<std::unique_ptr<Engine>> engines;
     std::unique_ptr<Vision> vision;
-    std::unique_ptr<Mtp> mtp;
+    // Vision + prefill run one request at a time (compute-bound: two at once only split the GPU); decode, which is
+    // bandwidth-bound, runs outside it, so one engine decodes while another encodes and prefills.
+    std::mutex cmu;
+    std::vector<std::unique_ptr<Mtp>> mtps;  // per engine, null where there is none (each holds its own 0.22 GB)
     int n_draft = 3;
     llama_model* vocab_model = nullptr;
     const llama_vocab* vocab = nullptr;
@@ -102,7 +110,8 @@ struct Server {
     // arrival from the running average service time, and again when its turn comes from the real wait.
     std::mutex qmu;
     std::condition_variable qcv;
-    uint64_t next_ticket = 0, serving = 0;
+    uint64_t next_ticket = 0, next_admit = 0;  // tickets in arrival order; next_admit takes the next free engine
+    std::vector<int> free_slots;
     double service_ms = 800.0;         // running average of a request's time on the GPU
     std::atomic<uint64_t> late{0};
 
@@ -135,8 +144,22 @@ std::vector<std::string> split(const std::string& s, const std::string& d) {
     return out;
 }
 
-json completion(Server& S, const json& req) {
-    const double t_start = now_ms();
+// A request's CPU work, done before it waits for its turn on the GPU: images decoded and resized, the grammar
+// built. Before, it ran after the turn came, with the GPU idle meanwhile.
+struct Prepared {
+    double t_start = 0, pre_ms = 0;
+    std::vector<std::string> parts;
+    std::vector<ImageU8> images;
+    std::string grammar;
+    int n_predict = 0;
+    bool profile = false;   // "profile": true - the prompt path's phase times come back in timings.profile
+};
+
+Prepared prepare(Server& S, const json& req) {
+    Prepared P;
+    P.t_start = now_ms();
+    const double t_start = P.t_start;
+    (void) t_start;
     std::string prompt;
     std::vector<std::string> media;
     const json& p = req.at("prompt");
@@ -162,13 +185,11 @@ json completion(Server& S, const json& req) {
     else if (req.contains("grammar") && req.at("grammar").is_string())
         grammar = req.at("grammar").get<std::string>();
 
-    // ---- the prompt: BOS, text parts, images (vision runs before taking the GPU lock's sequence)
-    Batch b;
+    // ---- the prompt: text parts and images (decoded and resized here, encoded on the GPU in completion())
     const std::vector<std::string> parts = split(prompt, S.marker);
     if (parts.size() - 1 != media.size())
         throw std::runtime_error("the prompt has " + std::to_string(parts.size() - 1) + " media markers but " +
                                  std::to_string(media.size()) + " images");
-    if (llama_vocab_get_add_bos(S.vocab)) b.tokens.push_back(llama_vocab_bos(S.vocab));
     if (!media.empty() && !S.vision) throw std::runtime_error("this server was started without --mmproj");
     // decode + resize every image on its own thread, before taking the GPU (CPU work, ~20 ms an image)
     const double t_pre = now_ms();
@@ -184,12 +205,30 @@ json completion(Server& S, const json& req) {
             if (!decode_image(bytes.data(), bytes.size(), raw, err)) throw std::runtime_error(err);
             return S.vision->preprocess(raw, img_tokens);
         }));
-    std::vector<ImageU8> images;
-    for (auto& f : pre) images.push_back(f.get());
-    const double pre_ms = now_ms() - t_pre;
-    std::lock_guard<std::mutex> lk(S.mu);
+    for (auto& f : pre) P.images.push_back(f.get());
+    P.pre_ms = now_ms() - t_pre;
+    P.parts = parts;
+    P.grammar = grammar;
+    P.n_predict = n_predict;
+    P.profile = req.value("profile", false);
+    return P;
+}
+
+json completion(Server& S, Prepared P, int slot) {
+    Engine& E = *S.engines[slot];
+    Mtp* mtp = S.mtps[slot].get();
+    const double t_start = P.t_start, pre_ms = P.pre_ms;
+    const std::vector<std::string>& parts = P.parts;
+    std::vector<ImageU8>& images = P.images;
+    const std::string& grammar = P.grammar;
+    const int n_predict = P.n_predict;
+    Batch b;
+    if (llama_vocab_get_add_bos(S.vocab)) b.tokens.push_back(llama_vocab_bos(S.vocab));
     double vis_ms = 0;
     int n_images = 0;
+    const double t_wait = now_ms();
+    std::unique_lock<std::mutex> compute(S.cmu);  // until the prefill is done
+    const double cw_ms = now_ms() - t_wait;
     for (size_t i = 0; i < parts.size(); ++i) {
         for (llama_token t : S.tokenize(parts[i])) b.tokens.push_back(t);
         if (i + 1 < parts.size()) {
@@ -210,7 +249,7 @@ json completion(Server& S, const json& req) {
 
     // ---- prefill, in chunks of at most `batch` rows that never cut an image span
     const double t_pp = now_ms();
-    Engine& E = *S.engine;
+    E.set_profile(P.profile);
     E.reset();
     {
         size_t row = 0, emb_row = 0;
@@ -236,6 +275,12 @@ json completion(Server& S, const json& req) {
         }
     }
     const double pp_ms = now_ms() - t_pp;
+    json prof = json::object();
+    if (P.profile) {
+        for (auto& [name, ms] : E.profile_take()) prof[name] = ms;
+        E.set_profile(false);
+    }
+    compute.unlock();
 
     // ---- greedy generation under the grammar
     llama_sampler* gs = nullptr;
@@ -285,9 +330,9 @@ json completion(Server& S, const json& req) {
         content += S.piece(id);
         if (n_gen >= n_predict) break;
         const int pos = E.n_past();
-        int nd = S.mtp ? std::min({S.n_draft, n_predict - n_gen, S.ctx - pos - 1, Engine::kSmall - 1}) : 0;
+        int nd = mtp ? std::min({S.n_draft, n_predict - n_gen, S.ctx - pos - 1, Engine::kSmall - 1}) : 0;
         drafts.clear();
-        if (nd > 0) S.mtp->draft(id, pos, E.hidden_dev(h_row), nd, drafts);
+        if (nd > 0) mtp->draft(id, pos, E.hidden_dev(h_row), nd, drafts);
         Batch w;
         w.tokens.push_back(id);
         w.tokens.insert(w.tokens.end(), drafts.begin(), drafts.end());
@@ -340,6 +385,8 @@ json completion(Server& S, const json& req) {
                   {"prompt_ms", pp_ms + vis_ms + pre_ms},
                   {"vision_ms", vis_ms},
                   {"image_prep_ms", pre_ms},
+                  {"compute_wait_ms", cw_ms},
+                  {"profile", prof},
                   {"images", n_images},
                   {"prefill_ms", pp_ms},
                   {"predicted_n", n_gen},
@@ -353,9 +400,10 @@ json completion(Server& S, const json& req) {
 
 // one synthetic request's worth of work at startup: cuBLAS / MMQ initialization and every CUDA graph the decode loop
 // can ask for (windows of 1..8 rows, drafts of 1..n_draft), so the first real request pays none of it
-void warmup(Server& S) {
+void warmup(Server& S, int slot) {
     const double t0 = now_ms();
-    Engine& E = *S.engine;
+    Engine& E = *S.engines[slot];
+    Mtp* mtp = S.mtps[slot].get();
     std::vector<float> emb;
     if (S.vision) {
         ImageU8 img;
@@ -377,17 +425,17 @@ void warmup(Server& S) {
         w.tokens.assign(n, b.tokens[1]);
         E.forward(w, Engine::Logits::All);
     }
-    if (S.mtp)
-        for (int n = 1; n <= std::min(S.n_draft, S.mtp->max_draft()); ++n) S.mtp->draft(b.tokens[1], base, E.hidden_dev(0), n, drafts);
+    if (mtp)
+        for (int n = 1; n <= std::min(S.n_draft, mtp->max_draft()); ++n) mtp->draft(b.tokens[1], base, E.hidden_dev(0), n, drafts);
     E.reset();
-    std::fprintf(stderr, "warmup: %.0f ms\n", now_ms() - t0);
+    std::fprintf(stderr, "warmup slot %d: %.0f ms\n", slot, now_ms() - t0);
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
     std::string model_path, mmproj, host = "127.0.0.1", key_file, mtp_path;
-    int n_draft = 3, max_queue = 0;
+    int n_draft = 3, max_queue = 0, slots = 1, mtp_slots = 1;
     int port = 8091, ctx = 4096, batch = 2048, img_tokens = 280, max_img_tokens = 280;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -407,6 +455,8 @@ int main(int argc, char** argv) {
         else if (a == "--batch" || a == "-b") batch = std::stoi(next());
         else if (a == "--image-tokens") img_tokens = std::stoi(next());
         else if (a == "--max-image-tokens") max_img_tokens = std::stoi(next());
+        else if (a == "--slots") slots = std::max(1, std::stoi(next()));
+        else if (a == "--mtp-slots") mtp_slots = std::max(0, std::stoi(next()));
         else if (a == "--mtp") mtp_path = next();
         else if (a == "--draft") n_draft = std::stoi(next());
         else if (a == "--max-queue") max_queue = std::stoi(next());
@@ -446,14 +496,16 @@ int main(int argc, char** argv) {
             S.vision.reset(new Vision(mmproj, img_tokens, std::max(4096, max_img_tokens * 9)));  // 3x3 patches a token
             std::fprintf(stderr, "vision: %s, %.2f GiB on the GPU\n", mmproj.c_str(), S.vision->weight_bytes() / 1073741824.0);
         }
-        S.engine.reset(new Engine(*S.model, ctx, batch));
         S.n_draft = n_draft;
-        if (!mtp_path.empty()) {
-            S.mtp.reset(new Mtp(mtp_path, *S.model, *S.engine, Engine::kSmall - 1));
-            std::fprintf(stderr, "mtp: %s, %.2f GiB, %d drafts per step\n", mtp_path.c_str(), S.mtp->bytes() / 1073741824.0, n_draft);
+        for (int k = 0; k < slots; ++k) {
+            S.engines.emplace_back(new Engine(*S.model, ctx, batch));
+            S.mtps.emplace_back(!mtp_path.empty() && k < mtp_slots
+                                    ? new Mtp(mtp_path, *S.model, *S.engines.back(), Engine::kSmall - 1) : nullptr);
+            std::fprintf(stderr, "engine slot %d: ctx %d, batch %d, %.2f GiB of buffers, mtp %s\n", k, ctx, batch,
+                         S.engines.back()->buffer_bytes() / 1073741824.0, S.mtps.back() ? "on" : "off");
         }
-        std::fprintf(stderr, "engine: ctx %d, batch %d, %.2f GiB of buffers\n", ctx, batch, S.engine->buffer_bytes() / 1073741824.0);
-        warmup(S);
+        for (int k = slots - 1; k >= 0; --k) S.free_slots.push_back(k);  // slot 0 (with MTP) is taken first
+        for (int k = 0; k < slots; ++k) warmup(S, k);
     } catch (const std::exception& e) {
         std::fprintf(stderr, "error: %s\n", e.what());
         return 1;
@@ -480,7 +532,8 @@ int main(int argc, char** argv) {
         if (!authorized(r)) return send_err(res, 401, "invalid api key");
         res.set_content(json{{"media_marker", S.marker}, {"n_ctx", S.ctx}, {"model", S.model_name},
                              {"engine", "strata-gemma"}, {"inflight", S.inflight.load()}, {"max_queue", S.max_queue},
-                                  {"service_ms", S.service_ms}, {"late", S.late.load()}}.dump(),
+                                  {"service_ms", S.service_ms}, {"late", S.late.load()},
+                                  {"slots", (int) S.engines.size()}}.dump(),
                         "application/json");
     });
     http.Post("/completion", [&](const httplib::Request& r, httplib::Response& res) {
@@ -502,34 +555,58 @@ int main(int argc, char** argv) {
         } slot(S.inflight);
         const int own = req.is_object() ? req.value("max_queue", 0) : 0;
         if ((S.max_queue > 0 && slot.v > S.max_queue) || (own > 0 && slot.v > own)) return send_err(res, 503, "busy");
+        Prepared prep;
+        try {
+            prep = prepare(S, req);   // CPU work while other requests use the GPU
+        } catch (const std::exception& e) {
+            return send_err(res, 400, e.what());
+        }
         const double t_arr = now_ms();
-        const double max_wait = req.is_object() ? req.value("max_wait_ms", 0.0) : 0.0;  // 0: wait as long as it takes
-        uint64_t ticket;
+        // the wait budget: "wait_until_ms" (unix epoch, so the caller's upload and the proxy count too; the hosts
+        // are NTP-synced) or "max_wait_ms" from now; 0: wait as long as it takes
+        double max_wait = req.is_object() ? req.value("max_wait_ms", 0.0) : 0.0;
+        if (req.is_object() && req.contains("wait_until_ms")) {
+            const double epoch_now = std::chrono::duration<double, std::milli>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            max_wait = std::max(1.0, req.value("wait_until_ms", 0.0) - epoch_now);
+        }
+        int eng;  // the engine this request runs on
         {
             std::unique_lock<std::mutex> lk(S.qmu);
-            const double ahead = (double) (S.next_ticket - S.serving);  // running + waiting before this one
-            if (max_wait > 0 && ahead * S.service_ms > max_wait) {
+            const double n = (double) S.engines.size();
+            const double waiting = (double) (S.next_ticket - S.next_admit);
+            const double busy = n - (double) S.free_slots.size();
+            // requests that must leave an engine before this one gets one, served n at a time
+            const double before = std::max(0.0, waiting + busy - n + 1);
+            if (max_wait > 0 && before / n * S.service_ms > max_wait) {
                 ++S.late;
                 return send_err(res, 503, "late");
             }
-            ticket = S.next_ticket++;
-            S.qcv.wait(lk, [&] { return S.serving == ticket; });
+            const uint64_t ticket = S.next_ticket++;
+            S.qcv.wait(lk, [&] { return S.next_admit == ticket && !S.free_slots.empty(); });
+            eng = S.free_slots.back();
+            S.free_slots.pop_back();
+            ++S.next_admit;
         }
-        struct Turn {  // the next request's turn, whatever happens to this one
+        S.qcv.notify_all();  // the next ticket may take another free engine
+        struct Turn {  // the engine goes back, whatever happens to this request
             Server& s;
+            int slot;
             ~Turn() {
-                std::lock_guard<std::mutex> g(s.qmu);
-                ++s.serving;
+                {
+                    std::lock_guard<std::mutex> g(s.qmu);
+                    s.free_slots.push_back(slot);
+                }
                 s.qcv.notify_all();
             }
-        } turn{S};
+        } turn{S, eng};
         if (max_wait > 0 && now_ms() - t_arr > max_wait) {
             ++S.late;
             return send_err(res, 503, "late");
         }
         try {
             const double t0 = now_ms();
-            const json out = completion(S, req);
+            const json out = completion(S, std::move(prep), eng);
             {
                 std::lock_guard<std::mutex> g(S.qmu);
                 S.service_ms = 0.9 * S.service_ms + 0.1 * (now_ms() - t0);
