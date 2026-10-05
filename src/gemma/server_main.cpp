@@ -348,13 +348,29 @@ json completion(Server& S, Prepared P, int slot) {
     const double t_wait = now_ms();
     std::unique_lock<std::mutex> compute(S.cmu);  // until the prefill is done
     const double cw_ms = now_ms() - t_wait;
+    // the pictures through the vision encoder first, consecutive ones of one size (video frames) a batch at a time;
+    // their embeddings land in b.embd in picture order, as the prompt takes them
+    std::vector<int> vis_n(images.size(), 0);
+    {
+        if (S.vision) S.vision->set_profile(P.profile);
+        const double tv = now_ms();
+        for (size_t i = first_part; i < images.size();) {
+            size_t j = i + 1;
+            const int cap = S.vision->max_batch(images[i]);
+            while (j < images.size() && (int) (j - i) < cap && images[j].nx == images[i].nx && images[j].ny == images[i].ny) ++j;
+            std::vector<const ImageU8*> batch;
+            for (size_t k = i; k < j; ++k) batch.push_back(&images[k]);
+            const int n = S.vision->encode_batch(batch, b.embd);
+            for (size_t k = i; k < j; ++k) vis_n[k] = n;
+            i = j;
+        }
+        vis_ms = now_ms() - tv;
+    }
     for (size_t i = first_part; i < parts.size(); ++i) {
         for (llama_token t : S.tokenize(parts[i])) b.tokens.push_back(t);
         if (i + 1 < parts.size()) {
             for (llama_token t : S.tokenize("<|image>")) b.tokens.push_back(t);
-            const double tv = now_ms();
-            const int n = S.vision->encode(images[i], b.embd);
-            vis_ms += now_ms() - tv;
+            const int n = vis_n[i];
             const int begin = (int) b.tokens.size();
             b.tokens.insert(b.tokens.end(), n, -1);
             b.spans.push_back(begin);
@@ -412,6 +428,10 @@ json completion(Server& S, Prepared P, int slot) {
     if (P.profile) {
         for (auto& [name, ms] : E.profile_take()) prof[name] = ms;
         E.set_profile(false);
+        if (S.vision) {
+            for (auto& [name, ms] : S.vision->profile_take()) prof[std::string("vision.") + name] = ms;
+            S.vision->set_profile(false);
+        }
     }
     compute.unlock();
 

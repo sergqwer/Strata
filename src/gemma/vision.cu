@@ -48,28 +48,29 @@ __device__ __forceinline__ float block_sum(float v) {
 // ---------------------------------------------------------------------------------------------------- kernels
 
 // patches [n][3 * P * P] f16, column (c, ky, kx) = the conv kernel's ggml layout; value = px / 255 * 2 - 1
+// a batch of same-size images back to back: block g is patch g % n of image g / n
 __global__ void patchify_kernel(const uint8_t* __restrict__ img, int nx, int P, int ncols, __half* __restrict__ out,
                                 int n) {
-    const int p = blockIdx.x;
-    if (p >= n) return;
+    const int g = blockIdx.x, p = g % n;
+    img += (size_t) (g / n) * n * P * P * 3;
     const int px = p % ncols, py = p / ncols;
     for (int j = threadIdx.x; j < 3 * P * P; j += blockDim.x) {
         const int c = j / (P * P), ky = (j / P) % P, kx = j % P;
         const int x = px * P + kx, y = py * P + ky;
         const float v = (float) img[((size_t) y * nx + x) * 3 + c] / 255.0f;
-        out[(size_t) p * 3 * P * P + j] = __float2half(v * 2.0f + -1.0f);
+        out[(size_t) g * 3 * P * P + j] = __float2half(v * 2.0f + -1.0f);
     }
 }
 
 __global__ void add_pos_kernel(float* __restrict__ x, const float* __restrict__ tbl, int pos_size, int D, int ncols,
                                int n) {
-    const int p = blockIdx.x;
+    const int g = blockIdx.x, p = g % n;   // row g: patch p of image g / n
     const int px = p % ncols, py = p / ncols;
     const float* tx = tbl + (size_t) px * D;
     const float* ty = tbl + ((size_t) pos_size + py) * D;
     for (int i = threadIdx.x; i < D; i += blockDim.x) {
-        float v = x[(size_t) p * D + i] + tx[i];
-        x[(size_t) p * D + i] = v + ty[i];
+        float v = x[(size_t) g * D + i] + tx[i];
+        x[(size_t) g * D + i] = v + ty[i];
     }
 }
 
@@ -105,13 +106,14 @@ __global__ void vit_qkv_kernel(const float* __restrict__ qkv, const float* __res
                                __half* __restrict__ Q, __half* __restrict__ K, __half* __restrict__ V, int n, int H,
                                int hd, int HDP, int ncols, float eps, float theta_scale) {
     __shared__ float buf[8][96];
-    const int p = blockIdx.x, warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int g = blockIdx.x, p = g % n, warp = threadIdx.x / 32, lane = threadIdx.x % 32;   // row g: patch p, image g / n
+    const size_t img_off = (size_t) (g / n) * H * n * HDP;
     const float pos_x = (float) (p % ncols), pos_y = (float) (p / ncols);
     const bool swap = theta_scale < 0.f;   // test hook: x / y swapped
     const float ts = fabsf(theta_scale);
     for (int slot = warp; slot < 3 * H; slot += 8) {
         const int which = slot / H, h = slot % H;
-        const float* src = qkv + (size_t) p * 3 * H * hd + (size_t) which * H * hd + (size_t) h * hd;
+        const float* src = qkv + (size_t) g * 3 * H * hd + (size_t) which * H * hd + (size_t) h * hd;
         float v[3];
         float ss = 0.f;
 #pragma unroll
@@ -131,7 +133,7 @@ __global__ void vit_qkv_kernel(const float* __restrict__ qkv, const float* __res
             if (i < 96) buf[warp][i] = y;
         }
         __syncwarp();
-        __half* dst = (which == 0 ? Q : which == 1 ? K : V) + ((size_t) h * n + p) * HDP;
+        __half* dst = (which == 0 ? Q : which == 1 ? K : V) + img_off + ((size_t) h * n + p) * HDP;
         const int half = hd / 2, quarter = hd / 4;
 #pragma unroll
         for (int c = 0; c < 3; ++c) {
@@ -165,9 +167,10 @@ __global__ void geglu_quick_kernel(const float* __restrict__ gu, bf16* __restric
 // 3x3 (k x k) average pool over the patch grid, then * scale, (x - bias) * std_scale, rms -> bf16
 __global__ void pool_kernel(const float* __restrict__ x, int ncols, int k, int D, float scale,
                             const float* __restrict__ sb, const float* __restrict__ ssc, bf16* __restrict__ out,
-                            float eps) {
+                            float eps, int n, int n_tok) {
     extern __shared__ float t[];
-    const int tok = blockIdx.x, ox_n = ncols / k;
+    const int tok = blockIdx.x % n_tok, ox_n = ncols / k;
+    x += (size_t) (blockIdx.x / n_tok) * n * D;   // image blockIdx.x / n_tok of the batch
     const int ox = tok % ox_n, oy = tok / ox_n;
     for (int i = threadIdx.x; i < D; i += blockDim.x) {
         float acc = 0.f;
@@ -182,7 +185,7 @@ __global__ void pool_kernel(const float* __restrict__ x, int ncols, int k, int D
     for (int i = threadIdx.x; i < D; i += blockDim.x) ss += t[i] * t[i];
     ss = block_sum(ss);
     const float sc = rsqrtf(ss / D + eps);
-    for (int i = threadIdx.x; i < D; i += blockDim.x) out[(size_t) tok * D + i] = __float2bfloat16(t[i] * sc);
+    for (int i = threadIdx.x; i < D; i += blockDim.x) out[(size_t) blockIdx.x * D + i] = __float2bfloat16(t[i] * sc);
 }
 
 __global__ void f32_to_f16_kernel(const float* __restrict__ a, __half* __restrict__ b, int64_t n) {
@@ -350,6 +353,13 @@ __global__ void __launch_bounds__(128) vit_fa2_kernel(const __half* __restrict__
     __shared__ __align__(16) __half Vt[HDP * LV];
     const int h = blockIdx.y, warp = threadIdx.x / 32, lane = threadIdx.x % 32, g = lane / 4, t = lane % 4;
     const int r0 = blockIdx.x * 64 + warp * 16;
+    {   // image blockIdx.z of a batch: its own Q / K / V blocks and output rows (each image attends only to itself)
+        const size_t z = blockIdx.z;
+        Q += z * H * n * HDP;
+        K += z * H * n * HDP;
+        V += z * H * n * HDP;
+        O += z * n * H * hd;
+    }
     const __half* Qh = Q + (size_t) h * n * HDP;
     const __half* Kh = K + (size_t) h * n * HDP;
     const __half* Vh = V + (size_t) h * n * HDP;
@@ -490,6 +500,11 @@ struct Vision::Impl {
     void* work = nullptr;
     cublasHandle_t blas = nullptr;
     cudaEvent_t e0 = nullptr, e1 = nullptr;
+    // set_profile: per-layer phase boundaries (kVisPhases + 1 events a layer), milliseconds summed per phase
+    bool prof = false;
+    std::vector<cudaEvent_t> pev;
+    std::vector<double> ptot;
+    void mark(int il, int k, cudaStream_t s);
 };
 
 Vision::Vision(const std::string& path, int tokens, int max_patches) : p_(new Impl), tokens_(tokens) {
@@ -643,17 +658,64 @@ ImageU8 Vision::preprocess(const ImageU8& raw, int tokens) const {
     return preprocess_gemma4(raw, p_->P, p_->merge, tokens_, tokens_);
 }
 
+static constexpr int kVisPhases = 12;
+static const char* kVisPhaseNames[kVisPhases] = {"rms1", "qkv_gemm", "qk_norm_rope", "attention", "attn_out_gemm",
+                                                 "add_rms_rms2", "gate_up_gemm", "geglu", "down_gemm", "add_rms_post",
+                                                 "patch_embed", "pool_proj"};
+
+void Vision::Impl::mark(int il, int k, cudaStream_t s) {
+    if (!prof) return;
+    const size_t nb = kVisPhases + 1, need = (layers.size() + 1) * nb;
+    if (pev.size() < need) {
+        for (size_t i = pev.size(); i < need; ++i) {
+            cudaEvent_t e;
+            ck(cudaEventCreate(&e), "event");
+            pev.push_back(e);
+        }
+        ptot.assign(kVisPhases, 0.0);
+    }
+    ck(cudaEventRecord(pev[(size_t) il * nb + k], s), "event record");
+}
+
+void Vision::set_profile(bool on) { p_->prof = on; }
+
+std::vector<std::pair<const char*, double>> Vision::profile_take() {
+    std::vector<std::pair<const char*, double>> out;
+    if (p_->ptot.empty()) return out;
+    for (int k = 0; k < kVisPhases; ++k) out.emplace_back(kVisPhaseNames[k], p_->ptot[k]);
+    p_->ptot.assign(kVisPhases, 0.0);
+    return out;
+}
+
 int Vision::encode(const ImageU8& img, std::vector<float>& out) {
+    return encode_batch({&img}, out);
+}
+
+int Vision::max_batch(const ImageU8& img) const {
+    const int n = (img.nx / p_->P) * (img.ny / p_->P);
+    return n > 0 ? std::max(1, p_->max_n / n) : 1;
+}
+
+// B images of one size in one pass: every GEMM over all B * n patch rows (one 70-token video frame alone is 540 rows,
+// too few to fill the GPU), attention per image (blockIdx.z), the pooled tokens image after image
+int Vision::encode_batch(const std::vector<const ImageU8*>& imgs, std::vector<float>& out) {
     Impl& m = *p_;
-    const int P = m.P, ncols = img.nx / P, nrows = img.ny / P, n = ncols * nrows;
+    if (imgs.empty()) return 0;
+    const ImageU8& img = *imgs[0];
+    const int B = (int) imgs.size();
+    const int P = m.P, ncols = img.nx / P, nrows = img.ny / P, n = ncols * nrows, N = B * n;
     if (img.nx % (P * m.merge) || img.ny % (P * m.merge)) throw std::runtime_error("vision: image size not aligned");
-    if (n > m.max_n) throw std::runtime_error("vision: " + std::to_string(n) + " patches > max " + std::to_string(m.max_n));
+    for (const ImageU8* o : imgs)
+        if (o->nx != img.nx || o->ny != img.ny) throw std::runtime_error("vision: a batch takes images of one size");
+    if (N > m.max_n) throw std::runtime_error("vision: " + std::to_string(N) + " patches > max " + std::to_string(m.max_n));
     const int D = m.D, F = m.F, H = m.H, hd = m.hd;
-    const int n_tok = (ncols / m.merge) * (nrows / m.merge);
+    const int n_tok = (ncols / m.merge) * (nrows / m.merge), T = B * n_tok;
     cudaStream_t s = s_;
     ck(cudaEventRecord(m.e0, s), "event");
-    ck(cudaMemcpyAsync(m.img, img.rgb.data(), img.rgb.size(), cudaMemcpyHostToDevice, s), "image upload");
-    patchify_kernel<<<n, 256, 0, s>>>(m.img, img.nx, P, ncols, m.patches, n);
+    for (int b = 0; b < B; ++b)
+        ck(cudaMemcpyAsync(m.img + (size_t) b * img.rgb.size(), imgs[b]->rgb.data(), img.rgb.size(),
+                           cudaMemcpyHostToDevice, s), "image upload");
+    patchify_kernel<<<N, 256, 0, s>>>(m.img, img.nx, P, ncols, m.patches, n);
     kcheck("patchify");
     const float one = 1.f, zero = 0.f;
     // Y [n][out] = X [n][in] . W [out][in]^T
@@ -662,38 +724,67 @@ int Vision::encode(const ImageU8& img, std::vector<float>& out) {
         cb(cublasGemmEx(m.blas, CUBLAS_OP_T, CUBLAS_OP_N, out_d, rows, in_d, &one, W, wt, in_d, X, xt, in_d, &zero, Y,
                         CUDA_R_32F, out_d, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT), what);
     };
-    gemm(m.patch_w, CUDA_R_16F, m.patches, CUDA_R_16F, m.x, n, D, 3 * P * P, "patch");
-    add_pos_kernel<<<n, 256, 0, s>>>(m.x, m.pos, m.pos_size, D, ncols, n);
+    gemm(m.patch_w, CUDA_R_16F, m.patches, CUDA_R_16F, m.x, N, D, 3 * P * P, "patch");
+    add_pos_kernel<<<N, 256, 0, s>>>(m.x, m.pos, m.pos_size, D, ncols, n);
     kcheck("add_pos");
     float theta_scale = powf(m.theta, -2.0f / (float) (hd / 2));
     if (std::getenv("STRATA_VIT_SWAPXY")) theta_scale = -theta_scale;
-    for (const Impl::Layer& L : m.layers) {
-        rms_bf16_kernel<<<n, 256, 0, s>>>(m.x, L.ln1, m.hb, D, m.eps);
-        gemm(L.wqkv, CUDA_R_16BF, m.hb, CUDA_R_16BF, m.qkv, n, 3 * D, D, "qkv");
-        vit_qkv_kernel<<<n, 256, 0, s>>>(m.qkv, L.qn, L.kn, m.Qh, m.Kh, m.Vh, n, H, hd, Impl::HDP, ncols, m.eps,
+    const int nl = (int) m.layers.size();
+    m.mark(nl, 0, s);   // the patch embedding: from here to layer 0's first mark
+    for (int il = 0; il < nl; ++il) {
+        const Impl::Layer& L = m.layers[il];
+        m.mark(il, 0, s);
+        rms_bf16_kernel<<<N, 256, 0, s>>>(m.x, L.ln1, m.hb, D, m.eps);
+        m.mark(il, 1, s);
+        gemm(L.wqkv, CUDA_R_16BF, m.hb, CUDA_R_16BF, m.qkv, N, 3 * D, D, "qkv");
+        m.mark(il, 2, s);
+        vit_qkv_kernel<<<N, 256, 0, s>>>(m.qkv, L.qn, L.kn, m.Qh, m.Kh, m.Vh, n, H, hd, Impl::HDP, ncols, m.eps,
                                           theta_scale);
         kcheck("vit_qkv");
-        vit_fa2_kernel<Impl::HDP><<<dim3((n + 63) / 64, H), 128, 0, s>>>(m.Qh, m.Kh, m.Vh, m.ab, n, H, hd);
+        m.mark(il, 3, s);
+        vit_fa2_kernel<Impl::HDP><<<dim3((n + 63) / 64, H, B), 128, 0, s>>>(m.Qh, m.Kh, m.Vh, m.ab, n, H, hd);
         kcheck("vit_fa");
-        gemm(L.wo, CUDA_R_16BF, m.ab, CUDA_R_16BF, m.y, n, D, D, "attn_out");
-        add_rms_kernel<<<n, 256, 0, s>>>(m.x, m.y, L.post_attn, D, m.eps);
-        rms_bf16_kernel<<<n, 256, 0, s>>>(m.x, L.ln2, m.hb, D, m.eps);
-        gemm(L.wgu, CUDA_R_16BF, m.hb, CUDA_R_16BF, m.gu, n, 2 * F, D, "gate_up");
-        geglu_quick_kernel<<<nblk((int64_t) n * F), 256, 0, s>>>(m.gu, m.fb, n, F);
-        gemm(L.wdown, CUDA_R_16BF, m.fb, CUDA_R_16BF, m.y, n, D, F, "down");
-        add_rms_kernel<<<n, 256, 0, s>>>(m.x, m.y, L.post_ffn, D, m.eps);
+        m.mark(il, 4, s);
+        gemm(L.wo, CUDA_R_16BF, m.ab, CUDA_R_16BF, m.y, N, D, D, "attn_out");
+        m.mark(il, 5, s);
+        add_rms_kernel<<<N, 256, 0, s>>>(m.x, m.y, L.post_attn, D, m.eps);
+        rms_bf16_kernel<<<N, 256, 0, s>>>(m.x, L.ln2, m.hb, D, m.eps);
+        m.mark(il, 6, s);
+        gemm(L.wgu, CUDA_R_16BF, m.hb, CUDA_R_16BF, m.gu, N, 2 * F, D, "gate_up");
+        m.mark(il, 7, s);
+        geglu_quick_kernel<<<nblk((int64_t) N * F), 256, 0, s>>>(m.gu, m.fb, N, F);
+        m.mark(il, 8, s);
+        gemm(L.wdown, CUDA_R_16BF, m.fb, CUDA_R_16BF, m.y, N, D, F, "down");
+        m.mark(il, 9, s);
+        add_rms_kernel<<<N, 256, 0, s>>>(m.x, m.y, L.post_ffn, D, m.eps);
         kcheck("layer");
+        m.mark(il, 10, s);
     }
-    pool_kernel<<<n_tok, 256, D * sizeof(float), s>>>(m.x, ncols, m.merge, D, sqrtf((float) D), m.std_bias, m.std_scale,
-                                                     m.hb, m.eps);
+    m.mark(nl, 1, s);   // the pooling + projection: from here to the end
+    pool_kernel<<<T, 256, D * sizeof(float), s>>>(m.x, ncols, m.merge, D, sqrtf((float) D), m.std_bias, m.std_scale,
+                                                 m.hb, m.eps, n, n_tok);
     kcheck("pool");
-    gemm(m.proj, CUDA_R_16BF, m.hb, CUDA_R_16BF, m.outv, n_tok, m.n_out, D, "projection");
+    gemm(m.proj, CUDA_R_16BF, m.hb, CUDA_R_16BF, m.outv, T, m.n_out, D, "projection");
     const size_t base = out.size();
-    out.resize(base + (size_t) n_tok * m.n_out);
-    ck(cudaMemcpyAsync(out.data() + base, m.outv, (size_t) n_tok * m.n_out * sizeof(float), cudaMemcpyDeviceToHost, s), "download");
+    out.resize(base + (size_t) T * m.n_out);
+    ck(cudaMemcpyAsync(out.data() + base, m.outv, (size_t) T * m.n_out * sizeof(float), cudaMemcpyDeviceToHost, s), "download");
     ck(cudaEventRecord(m.e1, s), "event");
+    m.mark(nl, 2, s);
     ck(cudaStreamSynchronize(s), "encode");
     cudaEventElapsedTime(&last_ms_, m.e0, m.e1);
+    if (m.prof) {
+        const size_t nb = kVisPhases + 1;
+        float ms = 0;
+        for (int il = 0; il < nl; ++il)
+            for (int k = 0; k < 10; ++k) {
+                cudaEventElapsedTime(&ms, m.pev[(size_t) il * nb + k], m.pev[(size_t) il * nb + k + 1]);
+                m.ptot[k] += ms;
+            }
+        cudaEventElapsedTime(&ms, m.pev[(size_t) nl * nb], m.pev[0]);
+        m.ptot[10] += ms;
+        cudaEventElapsedTime(&ms, m.pev[(size_t) nl * nb + 1], m.pev[(size_t) nl * nb + 2]);
+        m.ptot[11] += ms;
+    }
     return n_tok;
 }
 

@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace strata::gemma {
@@ -34,6 +35,14 @@ public:
     /// Encode one preprocessed image (preprocess() below): returns the number of soft tokens; their
     /// embeddings (n_tokens x n_embd_out floats) are appended to `out`.
     int encode(const ImageU8& img, std::vector<float>& out);
+    /// Several preprocessed images of one size in one pass (video frames): returns the soft tokens per image;
+    /// their embeddings are appended image after image. At most max_batch(img) images of that size.
+    int encode_batch(const std::vector<const ImageU8*>& imgs, std::vector<float>& out);
+    int max_batch(const ImageU8& img) const;
+    /// Time the encoder's phases with CUDA events (diagnosis): milliseconds per phase, summed over the layers and
+    /// the encodes since the last profile_take().
+    void set_profile(bool on);
+    std::vector<std::pair<const char*, double>> profile_take();
     /// Decode + resize as llama.cpp does for this model; with tokens > 0, transformers' resize for that budget
     /// (preprocess_gemma4_hf: video frames, 70 tokens).
     ImageU8 preprocess(const ImageU8& raw, int tokens = 0) const;
