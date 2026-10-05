@@ -183,6 +183,37 @@ const float* Engine::logits_host(int i) {
     return h_logits_.data();
 }
 
+size_t Engine::kv_row_bytes() const {
+    size_t b = 0;
+    for (int il = 0; il < m_.cfg.n_layer; ++il)
+        b += 2 * (size_t) m_.layers[il].n_head_kv * m_.layers[il].head_dim * sizeof(__half);
+    return b;
+}
+
+// host layout: per layer, K rows [0, n) then V rows [0, n) (each layer's cache is [ctx][n_kv][hd], rows contiguous)
+void Engine::kv_save(int n, void* host) const {
+    if (n > n_past_) throw std::runtime_error("kv_save: " + std::to_string(n) + " positions > " + std::to_string(n_past_) + " computed");
+    char* p = static_cast<char*>(host);
+    for (int il = 0; il < m_.cfg.n_layer; ++il) {
+        const size_t sz = (size_t) n * m_.layers[il].n_head_kv * m_.layers[il].head_dim * sizeof(__half);
+        ck(cudaMemcpyAsync(p, kc_[il], sz, cudaMemcpyDeviceToHost, s_), "kv save");
+        ck(cudaMemcpyAsync(p + sz, vc_[il], sz, cudaMemcpyDeviceToHost, s_), "kv save");
+        p += 2 * sz;
+    }
+}
+
+void Engine::kv_load(int n, const void* host) {
+    if (n > ctx_) throw std::runtime_error("kv_load: " + std::to_string(n) + " positions > ctx");
+    const char* p = static_cast<const char*>(host);
+    for (int il = 0; il < m_.cfg.n_layer; ++il) {
+        const size_t sz = (size_t) n * m_.layers[il].n_head_kv * m_.layers[il].head_dim * sizeof(__half);
+        ck(cudaMemcpyAsync(kc_[il], p, sz, cudaMemcpyHostToDevice, s_), "kv load");
+        ck(cudaMemcpyAsync(vc_[il], p + sz, sz, cudaMemcpyHostToDevice, s_), "kv load");
+        p += 2 * sz;
+    }
+    n_past_ = n;
+}
+
 void Engine::forward(const Batch& b, Logits mode) {
     const Config& c = m_.cfg;
     const int n = (int) b.tokens.size();

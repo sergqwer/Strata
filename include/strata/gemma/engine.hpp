@@ -43,6 +43,13 @@ public:
     /// The post-final-norm hidden state (the head's input, llama.cpp's h_nextn) of scored row i, on the device.
     const float* hidden_dev(int i = -1) const;
     const __half* k_cache(int il) const { return kc_[il]; }
+    /// Bytes of one position's K and V over all layers: what a saved prefix costs per token.
+    size_t kv_row_bytes() const;
+    /// Copy positions [0, n) of every layer's K and V to `host` (pinned, n * kv_row_bytes() bytes), enqueued on the
+    /// engine's stream; kv_load copies them back and the next forward continues at position n. A prompt's shared
+    /// prefix (system text, question, reference picture) is then computed once and reused.
+    void kv_save(int n, void* host) const;
+    void kv_load(int n, const void* host);
     const __half* v_cache(int il) const { return vc_[il]; }
     int ctx() const { return ctx_; }
     /// The last layer's expert choices of the last forward (rows x n_expert_used), for diagnostics.

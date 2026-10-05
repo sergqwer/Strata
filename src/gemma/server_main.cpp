@@ -6,10 +6,12 @@
 //                      "image_tokens": 70,   (optional: soft tokens per picture, transformers' resize; video frames)
 //                      "max_queue": 2,       (optional: 503 "busy" if this many requests are already in; low priority)
 //                      "max_wait_ms": 8000,  (optional: 503 "late" if its turn would / did come later than this)
-//                      "wait_until_ms": T}   (optional, the same as a unix-epoch time: the caller's upload counts too)
+//                      "wait_until_ms": T,   (optional, the same as a unix-epoch time: the caller's upload counts too)
+//                      "cache_prefix": 1}    (optional: the prompt through its first N pictures repeats across requests;
+//                                             with --prefix-cache-mb its KV is saved and reused - see PrefixCache)
 // Requests are served in arrival order.
 //                  -> {"content", "tokens_evaluated", "tokens_predicted", "stop", "stop_type", "timings": {...}}
-//   GET  /props    -> {"media_marker", "n_ctx", "model"}
+//   GET  /props    -> {"media_marker", "n_ctx", "model", ..., "prefix_cache": {entries, hits, misses, ...}}
 //   GET  /health   -> {"status": "ok"}
 //
 // Decoding is greedy (temperature 0; anything else is refused). A JSON schema or GBNF grammar constrains it with
@@ -20,6 +22,7 @@
 //   strata-gemma-server -m model.gguf --mmproj mmproj.gguf [--host 0.0.0.0] [--port 8091] [--api-key-file F]
 //                       [--ctx 4096] [--batch 2048] [--image-tokens 280] [--max-image-tokens 560]
 //                       [--mtp mtp.gguf --draft 3] [--max-queue N] [--slots N] [--mtp-slots M]
+//                       [--prefix-cache-mb 0] [--prefix-max-tokens 768]
 // --max-image-tokens sizes the vision work buffers for the largest per-request "image_tokens" (~90 KB a patch).
 #include "strata/gemma/engine.hpp"
 #include "strata/gemma/image.hpp"
@@ -41,10 +44,12 @@
 #include <cstdio>
 #include <fstream>
 #include <future>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 using namespace strata::gemma;
@@ -83,6 +88,87 @@ std::vector<uint8_t> b64decode(const std::string& in) {
     return out;
 }
 
+// Saved prompt prefixes ("cache_prefix": k in a request = the prompt up to the end of its k-th picture is shared with
+// other requests). Production's area / binary pages start with the system text, the question and a reference picture
+// that repeats - 31 distinct ones over 4.4k area pages in 3 h, the same pixels in 99% of the pages - and that part
+// (~600 tokens: a picture through the vision encoder and its prefill) cost ~40% of such a page. Its KV (~225 KB a
+// token) is kept in pinned host memory, in fixed slots allocated at startup, and copied back in a few ms over PCIe.
+// The key is the exact text and picture bytes of the prefix, compared in full: a hit is the same computation.
+struct PrefixCache {
+    struct Entry {
+        PrefixCache* owner = nullptr;
+        std::string key;
+        int n_tokens = 0;
+        int slot = -1;
+        ~Entry() {
+            if (owner && slot >= 0) {
+                std::lock_guard<std::mutex> l(owner->fmu);
+                owner->free.push_back(slot);
+            }
+        }
+    };
+    using Ptr = std::shared_ptr<Entry>;
+    int max_tokens = 0;
+    size_t slot_bytes = 0;
+    std::vector<void*> slots;               // pinned host buffers, max_tokens positions each
+    std::mutex mu;                          // lru + map + counters
+    std::list<Ptr> lru;                     // most recently used first
+    std::unordered_map<std::string, std::list<Ptr>::iterator> map;
+    std::mutex fmu;                         // the free slots (an evicted entry still in use frees its slot later)
+    std::vector<int> free;
+    uint64_t hits = 0, misses = 0, stored = 0, evicted = 0, uncached = 0;
+
+    bool on() const { return !slots.empty(); }
+    Ptr find(const std::string& key) {
+        std::lock_guard<std::mutex> l(mu);
+        auto it = map.find(key);
+        if (it == map.end()) {
+            ++misses;
+            return nullptr;
+        }
+        ++hits;
+        lru.splice(lru.begin(), lru, it->second);
+        return *it->second;
+    }
+    // a slot for a new prefix, evicting the least recently used entries; null when every slot is held by a request
+    Ptr reserve(const std::string& key, int n_tokens) {
+        std::lock_guard<std::mutex> l(mu);
+        for (;;) {
+            {
+                std::lock_guard<std::mutex> f(fmu);
+                if (!free.empty()) {
+                    auto e = std::make_shared<Entry>();
+                    e->owner = this;
+                    e->key = key;
+                    e->n_tokens = n_tokens;
+                    e->slot = free.back();
+                    free.pop_back();
+                    return e;
+                }
+            }
+            if (lru.empty()) {
+                ++uncached;
+                return nullptr;
+            }
+            map.erase(lru.back()->key);
+            lru.pop_back();   // frees its slot now, or when the last request using it finishes
+            ++evicted;
+        }
+    }
+    void insert(const Ptr& e) {
+        std::lock_guard<std::mutex> l(mu);
+        if (map.count(e->key)) return;   // another request stored the same prefix meanwhile: this slot goes back
+        lru.push_front(e);
+        map[e->key] = lru.begin();
+        ++stored;
+    }
+    json stats() {
+        std::lock_guard<std::mutex> l(mu);
+        return json{{"entries", (int) lru.size()}, {"slots", (int) slots.size()}, {"max_tokens", max_tokens},
+                    {"hits", hits}, {"misses", misses}, {"stored", stored}, {"evicted", evicted}, {"uncached", uncached}};
+    }
+};
+
 struct Server {
     std::unique_ptr<Model> model;
     // --slots N: N engines over the one set of weights, each with its own KV cache, buffers, CUDA stream and graphs.
@@ -114,6 +200,7 @@ struct Server {
     std::vector<int> free_slots;
     double service_ms = 800.0;         // running average of a request's time on the GPU
     std::atomic<uint64_t> late{0};
+    PrefixCache prefix;
 
     std::vector<llama_token> tokenize(const std::string& text) const {
         std::vector<llama_token> t(text.size() + 8);
@@ -153,6 +240,9 @@ struct Prepared {
     std::string grammar;
     int n_predict = 0;
     bool profile = false;   // "profile": true - the prompt path's phase times come back in timings.profile
+    int prefix_k = 0;                 // "cache_prefix": the prompt through this many pictures is a shared prefix
+    std::string prefix_key;           // its exact key (when the cache is on)
+    PrefixCache::Ptr prefix;          // a saved one: its pictures are neither decoded nor encoded
 };
 
 Prepared prepare(Server& S, const json& req) {
@@ -191,10 +281,28 @@ Prepared prepare(Server& S, const json& req) {
         throw std::runtime_error("the prompt has " + std::to_string(parts.size() - 1) + " media markers but " +
                                  std::to_string(media.size()) + " images");
     if (!media.empty() && !S.vision) throw std::runtime_error("this server was started without --mmproj");
+    // a shared prefix through picture k: looked up now, so a saved one's pictures are not even decoded
+    const int k = req.value("cache_prefix", 0);
+    if (k > 0 && k <= (int) media.size() && S.prefix.on()) {
+        P.prefix_k = k;
+        std::string key = std::to_string(img_tokens);
+        for (int i = 0; i < k; ++i) {
+            key += '\x01' + std::to_string(parts[i].size()) + '\x01' + parts[i];
+            key += '\x02' + std::to_string(media[i].size()) + '\x02' + media[i];
+        }
+        P.prefix = S.prefix.find(key);
+        P.prefix_key = std::move(key);
+    }
+    const int skip = P.prefix ? P.prefix_k : 0;
     // decode + resize every image on its own thread, before taking the GPU (CPU work, ~20 ms an image)
     const double t_pre = now_ms();
     std::vector<std::future<ImageU8>> pre;
-    for (const std::string& m : media)
+    for (size_t mi = 0; mi < media.size(); ++mi) {
+        const std::string& m = media[mi];
+        if ((int) mi < skip) {
+            pre.push_back(std::async(std::launch::deferred, []() { return ImageU8(); }));
+            continue;
+        }
         pre.push_back(std::async(std::launch::async, [&S, m, img_tokens]() {
             std::string data = m;
             const size_t comma = data.find(',');
@@ -205,6 +313,7 @@ Prepared prepare(Server& S, const json& req) {
             if (!decode_image(bytes.data(), bytes.size(), raw, err)) throw std::runtime_error(err);
             return S.vision->preprocess(raw, img_tokens);
         }));
+    }
     for (auto& f : pre) P.images.push_back(f.get());
     P.pre_ms = now_ms() - t_pre;
     P.parts = parts;
@@ -223,13 +332,23 @@ json completion(Server& S, Prepared P, int slot) {
     const std::string& grammar = P.grammar;
     const int n_predict = P.n_predict;
     Batch b;
-    if (llama_vocab_get_add_bos(S.vocab)) b.tokens.push_back(llama_vocab_bos(S.vocab));
+    // a saved prefix: its positions are in its KV already (placeholders here, never computed); else the prompt is
+    // built whole and prefix_end marks where its shared part ends
+    const PrefixCache::Ptr& saved = P.prefix;
+    size_t first_part = 0, prefix_end = 0;
+    if (saved) {
+        b.tokens.assign(saved->n_tokens, 0);
+        first_part = P.prefix_k;
+        prefix_end = saved->n_tokens;
+    } else if (llama_vocab_get_add_bos(S.vocab)) {
+        b.tokens.push_back(llama_vocab_bos(S.vocab));
+    }
     double vis_ms = 0;
     int n_images = 0;
     const double t_wait = now_ms();
     std::unique_lock<std::mutex> compute(S.cmu);  // until the prefill is done
     const double cw_ms = now_ms() - t_wait;
-    for (size_t i = 0; i < parts.size(); ++i) {
+    for (size_t i = first_part; i < parts.size(); ++i) {
         for (llama_token t : S.tokenize(parts[i])) b.tokens.push_back(t);
         if (i + 1 < parts.size()) {
             for (llama_token t : S.tokenize("<|image>")) b.tokens.push_back(t);
@@ -242,6 +361,7 @@ json completion(Server& S, Prepared P, int slot) {
             b.spans.push_back(begin + n);
             for (llama_token t : S.tokenize("<image|>")) b.tokens.push_back(t);
             ++n_images;
+            if (!saved && (int) i + 1 == P.prefix_k) prefix_end = b.tokens.size();
         }
     }
     const int n_prompt = (int) b.tokens.size();
@@ -251,10 +371,21 @@ json completion(Server& S, Prepared P, int slot) {
     const double t_pp = now_ms();
     E.set_profile(P.profile);
     E.reset();
+    // the shared prefix is always a forward of its own (saved or not), so a reused one gives the same numbers as
+    // the first computation; it is saved when it fits a slot and a slot is free
+    PrefixCache::Ptr fresh;
+    if (saved) {
+        E.kv_load(saved->n_tokens, S.prefix.slots[saved->slot]);
+    } else if (prefix_end > 0 && (prefix_end > (size_t) S.prefix.max_tokens || prefix_end >= b.tokens.size())) {
+        prefix_end = 0;   // too long for a slot, or nothing after it
+    } else if (prefix_end > 0) {
+        fresh = S.prefix.reserve(P.prefix_key, (int) prefix_end);
+    }
     {
-        size_t row = 0, emb_row = 0;
+        size_t row = saved ? prefix_end : 0, emb_row = 0;
         while (row < b.tokens.size()) {
             size_t end = std::min(b.tokens.size(), row + (size_t) S.batch);
+            if (row < prefix_end) end = std::min(end, prefix_end);
             for (size_t s = 0; s + 1 < b.spans.size(); s += 2)
                 if ((size_t) b.spans[s] < end && (size_t) b.spans[s + 1] > end) end = b.spans[s];
             if (end <= row) throw std::runtime_error("an image is larger than the batch");
@@ -271,9 +402,11 @@ json completion(Server& S, Prepared P, int slot) {
                     c.spans.push_back(b.spans[s + 1]);
                 }
             E.forward(c, end == b.tokens.size());
+            if (fresh && end == prefix_end) E.kv_save((int) prefix_end, S.prefix.slots[fresh->slot]);
             row = end;
         }
     }
+    if (fresh) S.prefix.insert(fresh);   // the last forward synchronized the stream: the copy is complete
     const double pp_ms = now_ms() - t_pp;
     json prof = json::object();
     if (P.profile) {
@@ -388,6 +521,8 @@ json completion(Server& S, Prepared P, int slot) {
                   {"compute_wait_ms", cw_ms},
                   {"profile", prof},
                   {"images", n_images},
+                  {"prefix_n", (int) prefix_end},
+                  {"prefix_cached", saved ? 1 : 0},
                   {"prefill_ms", pp_ms},
                   {"predicted_n", n_gen},
                   {"predicted_ms", tg_ms},
@@ -435,7 +570,8 @@ void warmup(Server& S, int slot) {
 
 int main(int argc, char** argv) {
     std::string model_path, mmproj, host = "127.0.0.1", key_file, mtp_path;
-    int n_draft = 3, max_queue = 0, slots = 1, mtp_slots = 1;
+    int n_draft = 3, max_queue = 0, slots = 1, mtp_slots = 1, prefix_tokens = 768;
+    long long prefix_mb = 0;
     int port = 8091, ctx = 4096, batch = 2048, img_tokens = 280, max_img_tokens = 280;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -460,6 +596,8 @@ int main(int argc, char** argv) {
         else if (a == "--mtp") mtp_path = next();
         else if (a == "--draft") n_draft = std::stoi(next());
         else if (a == "--max-queue") max_queue = std::stoi(next());
+        else if (a == "--prefix-cache-mb") prefix_mb = std::stoll(next());
+        else if (a == "--prefix-max-tokens") prefix_tokens = std::stoi(next());
         else {
             std::fprintf(stderr, "unknown argument %s\n", a.c_str());
             return 2;
@@ -504,6 +642,19 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "engine slot %d: ctx %d, batch %d, %.2f GiB of buffers, mtp %s\n", k, ctx, batch,
                          S.engines.back()->buffer_bytes() / 1073741824.0, S.mtps.back() ? "on" : "off");
         }
+        if (prefix_mb > 0 && prefix_tokens > 0) {   // pinned host slots for saved prompt prefixes
+            S.prefix.max_tokens = prefix_tokens;
+            S.prefix.slot_bytes = (size_t) prefix_tokens * S.engines[0]->kv_row_bytes();
+            const long long n = prefix_mb * (1ll << 20) / (long long) S.prefix.slot_bytes;
+            for (long long k = 0; k < n; ++k) {
+                void* h = nullptr;
+                if (cudaHostAlloc(&h, S.prefix.slot_bytes, cudaHostAllocDefault) != cudaSuccess) break;
+                S.prefix.slots.push_back(h);
+                S.prefix.free.push_back((int) k);
+            }
+            std::fprintf(stderr, "prefix cache: %zu slots of %d tokens (%.0f MiB each, pinned)\n", S.prefix.slots.size(),
+                         prefix_tokens, S.prefix.slot_bytes / 1048576.0);
+        }
         for (int k = slots - 1; k >= 0; --k) S.free_slots.push_back(k);  // slot 0 (with MTP) is taken first
         for (int k = 0; k < slots; ++k) warmup(S, k);
     } catch (const std::exception& e) {
@@ -533,7 +684,7 @@ int main(int argc, char** argv) {
         res.set_content(json{{"media_marker", S.marker}, {"n_ctx", S.ctx}, {"model", S.model_name},
                              {"engine", "strata-gemma"}, {"inflight", S.inflight.load()}, {"max_queue", S.max_queue},
                                   {"service_ms", S.service_ms}, {"late", S.late.load()},
-                                  {"slots", (int) S.engines.size()}}.dump(),
+                                  {"slots", (int) S.engines.size()}, {"prefix_cache", S.prefix.stats()}}.dump(),
                         "application/json");
     });
     http.Post("/completion", [&](const httplib::Request& r, httplib::Response& res) {
