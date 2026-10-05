@@ -4,7 +4,9 @@
 //   POST /completion  {"prompt": "<raw prompt>" | {"prompt_string": "...<__media__>...", "multimodal_data": [b64...]},
 //                      "n_predict": 300, "temperature": 0, "json_schema": {...} | "grammar": "<gbnf>",
 //                      "image_tokens": 70,   (optional: soft tokens per picture, transformers' resize; video frames)
-//                      "max_queue": 2}       (optional: 503 "busy" if this many requests are already in; low priority)
+//                      "max_queue": 2,       (optional: 503 "busy" if this many requests are already in; low priority)
+//                      "max_wait_ms": 8000}  (optional: 503 "late" if its turn would / did come later than this)
+// Requests are served in arrival order.
 //                  -> {"content", "tokens_evaluated", "tokens_predicted", "stop", "stop_type", "timings": {...}}
 //   GET  /props    -> {"media_marker", "n_ctx", "model"}
 //   GET  /health   -> {"status": "ok"}
@@ -34,6 +36,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <fstream>
 #include <future>
@@ -94,6 +97,14 @@ struct Server {
     int max_queue = 0;                 // > 0: answer 503 "busy" when this many requests are already in (running + waiting)
     std::atomic<int> inflight{0};
     std::mutex mu;   // one sequence on the GPU at a time
+    // FIFO turns with a time budget: requests are served in arrival order (a plain mutex has no order), and one
+    // with "max_wait_ms" is refused (503 "late") when the requests ahead of it would keep it waiting longer - at
+    // arrival from the running average service time, and again when its turn comes from the real wait.
+    std::mutex qmu;
+    std::condition_variable qcv;
+    uint64_t next_ticket = 0, serving = 0;
+    double service_ms = 800.0;         // running average of a request's time on the GPU
+    std::atomic<uint64_t> late{0};
 
     std::vector<llama_token> tokenize(const std::string& text) const {
         std::vector<llama_token> t(text.size() + 8);
@@ -450,6 +461,9 @@ int main(int argc, char** argv) {
 
     httplib::Server http;
     http.set_payload_max_length(64ull << 20);
+    // requests waiting for their turn hold a thread each; the default pool (8, up to 32) could fill up and leave new
+    // ones queued inside httplib, where their wait is not seen
+    http.new_task_queue = [] { return new httplib::ThreadPool(64); };
     auto authorized = [&](const httplib::Request& r) {
         if (S.api_key.empty()) return true;
         const std::string h = r.get_header_value("Authorization");
@@ -465,7 +479,8 @@ int main(int argc, char** argv) {
     http.Get("/props", [&](const httplib::Request& r, httplib::Response& res) {
         if (!authorized(r)) return send_err(res, 401, "invalid api key");
         res.set_content(json{{"media_marker", S.marker}, {"n_ctx", S.ctx}, {"model", S.model_name},
-                             {"engine", "strata-gemma"}, {"inflight", S.inflight.load()}, {"max_queue", S.max_queue}}.dump(),
+                             {"engine", "strata-gemma"}, {"inflight", S.inflight.load()}, {"max_queue", S.max_queue},
+                                  {"service_ms", S.service_ms}, {"late", S.late.load()}}.dump(),
                         "application/json");
     });
     http.Post("/completion", [&](const httplib::Request& r, httplib::Response& res) {
@@ -487,8 +502,38 @@ int main(int argc, char** argv) {
         } slot(S.inflight);
         const int own = req.is_object() ? req.value("max_queue", 0) : 0;
         if ((S.max_queue > 0 && slot.v > S.max_queue) || (own > 0 && slot.v > own)) return send_err(res, 503, "busy");
+        const double t_arr = now_ms();
+        const double max_wait = req.is_object() ? req.value("max_wait_ms", 0.0) : 0.0;  // 0: wait as long as it takes
+        uint64_t ticket;
+        {
+            std::unique_lock<std::mutex> lk(S.qmu);
+            const double ahead = (double) (S.next_ticket - S.serving);  // running + waiting before this one
+            if (max_wait > 0 && ahead * S.service_ms > max_wait) {
+                ++S.late;
+                return send_err(res, 503, "late");
+            }
+            ticket = S.next_ticket++;
+            S.qcv.wait(lk, [&] { return S.serving == ticket; });
+        }
+        struct Turn {  // the next request's turn, whatever happens to this one
+            Server& s;
+            ~Turn() {
+                std::lock_guard<std::mutex> g(s.qmu);
+                ++s.serving;
+                s.qcv.notify_all();
+            }
+        } turn{S};
+        if (max_wait > 0 && now_ms() - t_arr > max_wait) {
+            ++S.late;
+            return send_err(res, 503, "late");
+        }
         try {
+            const double t0 = now_ms();
             const json out = completion(S, req);
+            {
+                std::lock_guard<std::mutex> g(S.qmu);
+                S.service_ms = 0.9 * S.service_ms + 0.1 * (now_ms() - t0);
+            }
             res.set_content(out.dump(), "application/json");
         } catch (const std::exception& e) {
             send_err(res, 400, e.what());
