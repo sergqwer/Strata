@@ -4,6 +4,7 @@
 //   POST /completion  {"prompt": "<raw prompt>" | {"prompt_string": "...<__media__>...", "multimodal_data": [b64...]},
 //                      "n_predict": 300, "temperature": 0, "json_schema": {...} | "grammar": "<gbnf>",
 //                      "image_tokens": 70,   (optional: soft tokens per picture, transformers' resize; video frames)
+//                      "image_tokens_list": [560, 70, 70],   (optional: per picture, 0 = image_tokens; drag pieces)
 //                      "max_queue": 2,       (optional: 503 "busy" if this many requests are already in; low priority)
 //                      "max_wait_ms": 8000,  (optional: 503 "late" if its turn would / did come later than this)
 //                      "wait_until_ms": T,   (optional, the same as a unix-epoch time: the caller's upload counts too)
@@ -265,10 +266,17 @@ Prepared prepare(Server& S, const json& req) {
     if (req.value("temperature", 0.0) > 0.0) throw std::runtime_error("only greedy decoding (temperature 0) is implemented");
     const int n_predict = std::min(req.value("n_predict", 512), S.ctx);
     // soft tokens per picture for this request (video frames: 70); 0 = the server's --image-tokens as llama.cpp does
+    const auto valid_tokens = [](int t) { return t == 0 || t == 70 || t == 140 || t == 280 || t == 560 || t == 1120; };
     const int img_tokens = req.value("image_tokens", 0);
-    if (img_tokens != 0 && img_tokens != 70 && img_tokens != 140 && img_tokens != 280 && img_tokens != 560 &&
-        img_tokens != 1120)
-        throw std::runtime_error("image_tokens must be one of 70, 140, 280, 560, 1120");
+    if (!valid_tokens(img_tokens)) throw std::runtime_error("image_tokens must be one of 70, 140, 280, 560, 1120");
+    // optional: a budget per picture (0: image_tokens) - drag pieces of ~85 px need far fewer tokens than the scene
+    std::vector<int> tok_list;
+    if (req.contains("image_tokens_list") && req.at("image_tokens_list").is_array())
+        for (const auto& v : req.at("image_tokens_list")) {
+            const int t = v.get<int>();
+            if (!valid_tokens(t)) throw std::runtime_error("image_tokens_list: each must be one of 0, 70, 140, 280, 560, 1120");
+            tok_list.push_back(t);
+        }
     std::string grammar;
     if (req.contains("json_schema") && !req.at("json_schema").is_null())
         grammar = json_schema_to_grammar(common_json::parse(req.at("json_schema").dump()));
@@ -281,6 +289,10 @@ Prepared prepare(Server& S, const json& req) {
         throw std::runtime_error("the prompt has " + std::to_string(parts.size() - 1) + " media markers but " +
                                  std::to_string(media.size()) + " images");
     if (!media.empty() && !S.vision) throw std::runtime_error("this server was started without --mmproj");
+    if (!tok_list.empty() && tok_list.size() != media.size())
+        throw std::runtime_error("image_tokens_list has " + std::to_string(tok_list.size()) + " entries for " +
+                                 std::to_string(media.size()) + " images");
+    const auto tokens_of = [&](size_t mi) { return tok_list.empty() || !tok_list[mi] ? img_tokens : tok_list[mi]; };
     // a shared prefix through picture k: looked up now, so a saved one's pictures are not even decoded
     const int k = req.value("cache_prefix", 0);
     if (k > 0 && k <= (int) media.size() && S.prefix.on()) {
@@ -288,7 +300,7 @@ Prepared prepare(Server& S, const json& req) {
         std::string key = std::to_string(img_tokens);
         for (int i = 0; i < k; ++i) {
             key += '\x01' + std::to_string(parts[i].size()) + '\x01' + parts[i];
-            key += '\x02' + std::to_string(media[i].size()) + '\x02' + media[i];
+            key += '\x02' + std::to_string(media[i].size()) + '\x02' + media[i] + '\x03' + std::to_string(tokens_of(i));
         }
         P.prefix = S.prefix.find(key);
         P.prefix_key = std::move(key);
@@ -303,7 +315,7 @@ Prepared prepare(Server& S, const json& req) {
             pre.push_back(std::async(std::launch::deferred, []() { return ImageU8(); }));
             continue;
         }
-        pre.push_back(std::async(std::launch::async, [&S, m, img_tokens]() {
+        pre.push_back(std::async(std::launch::async, [&S, m, t = tokens_of(mi)]() {
             std::string data = m;
             const size_t comma = data.find(',');
             if (data.rfind("data:", 0) == 0 && comma != std::string::npos) data = data.substr(comma + 1);
@@ -311,7 +323,7 @@ Prepared prepare(Server& S, const json& req) {
             ImageU8 raw;
             std::string err;
             if (!decode_image(bytes.data(), bytes.size(), raw, err)) throw std::runtime_error(err);
-            return S.vision->preprocess(raw, img_tokens);
+            return S.vision->preprocess(raw, t);
         }));
     }
     for (auto& f : pre) P.images.push_back(f.get());
