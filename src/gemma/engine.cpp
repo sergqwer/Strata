@@ -4,6 +4,7 @@
 #include "strata/gemma/decode.hpp"
 #include "strata/gemma/kernels.hpp"
 #include "strata/gemma/mmq.hpp"
+#include "strata/gemma/moe_w4a16.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 
 #include <cublas_v2.h>
@@ -116,7 +117,7 @@ Engine::Engine(const Model& m, int ctx, int max_batch) : m_(m), ctx_(ctx), max_b
         rlog_ = carve<float>(N * E);
         ew_ = carve<float>(N * K);
         eid_ = carve<int32_t>(N * K);
-        gu_ = carve<float>(N * K * 2 * FE);
+        gu_ = carve<float>(std::max(N * K * 2 * FE, (N * K * D + 1) / 2));   // also the w4a16 path's fp16 expert inputs
         eh_ = carve<float>(N * K * FE);
         ey_ = carve<float>(N * K * D);
         bounds_ = carve<int32_t>(E + 1);
@@ -170,6 +171,23 @@ Engine::~Engine() {
     if (ev_join_) cudaEventDestroy(ev_join_);
     if (side_) cudaStreamDestroy(side_);
     if (s_) cudaStreamDestroy(s_);
+}
+
+bool Engine::set_moe_w4a16(bool on) {
+    w4a16_ = false;
+    if (!on) return false;
+    const Config& c = m_.cfg;
+    for (const Layer& L : m_.layers) {
+        if (!L.moe()) continue;
+        if (!w4a16::supported(L.gate_up_exps.type, L.down_exps.type, c.n_embd, c.n_ff_exp, L.gate_up_exps.nb1,
+                              L.down_exps.nb1, L.gate_up_exps.d, L.down_exps.d, L.gate_up_exps.nb2, L.down_exps.nb2) ||
+            L.gate_up_exps.ne[1] != 2 * c.n_ff_exp || L.down_exps.ne[1] != c.n_embd) {
+            std::fprintf(stderr, "strata: --moe-w4a16: these expert tensors are not covered (moe_w4a16.cu supported()): off\n");
+            return false;
+        }
+    }
+    w4a16_ = true;
+    return true;
 }
 
 std::vector<int32_t> Engine::debug_expert_ids(int rows) const {
@@ -533,53 +551,66 @@ void Engine::layer_big(int il, int n) {
         dump("ffn_moe_weights_norm", il, ew_, K, n, s_);
         k::moe_sort2(eid_, n, K, E, bounds_, src_, inv_, counts_, s_);
         const int64_t rows = (int64_t) n * K;
-        int max_rows = 0;
-        if (legacy) {
-            // MMQ's grid spans max_rows tokens per expert; with every expert sized for all n tokens, its stream-k split
-            // hands most blocks empty tiles (4-5x slower). The bounds come back to the host for the true maximum.
-            h_bounds_.resize(E + 1);
-            ck(cudaMemcpyAsync(h_bounds_.data(), bounds_, (E + 1) * sizeof(int32_t), cudaMemcpyDeviceToHost, s_), "bounds");
-            mmq::quantize(g_, src_, xq_, L.gate_up_exps.type, D, D, rows, s_);
-            ck(cudaStreamSynchronize(s_), "bounds");
-            max_rows = 1;
-            for (int e = 0; e < E; ++e) max_rows = std::max(max_rows, h_bounds_[e + 1] - h_bounds_[e]);
-        } else {
-            // each token rounded once and written to its K sorted rows (the same bytes); the products build their
-            // tile lists on the device from bounds_, so nothing comes back to the host
-            mmq::quantize_scatter(g_, inv_, xq_, L.gate_up_exps.type, D, D, n, K, rows, s_);
+        if (w4a16_) {
+            // fp16 expert inputs (one copy per chosen expert, sorted) -> gate_up with the GeGLU in its epilogue -> fp16
+            // hidden -> down -> ey_, all on the device (no host sync): xs lives in gu_, the hidden in eh_
+            __half* xs = reinterpret_cast<__half*>(gu_);
+            __half* hid = reinterpret_cast<__half*>(eh_);
+            w4a16::scatter(g_, D, inv_, n, K, xs, s_);
+            mark(il, 5);
+            w4a16::gate_up(L.gate_up_exps.d, L.gate_up_exps.nb1, L.gate_up_exps.nb2, D, FE, xs, bounds_, E, rows, hid, s_);
+            mark(il, 6);
+            w4a16::down(L.down_exps.d, L.down_exps.nb1, L.down_exps.nb2, FE, D, hid, bounds_, E, rows, ey_, s_);
+            mark(il, 7);
+        } else {   // q8_1 + MMQ (the default)
+            int max_rows = 0;
+            if (legacy) {
+                // MMQ's grid spans max_rows tokens per expert; with every expert sized for all n tokens, its stream-k split
+                // hands most blocks empty tiles (4-5x slower). The bounds come back to the host for the true maximum.
+                h_bounds_.resize(E + 1);
+                ck(cudaMemcpyAsync(h_bounds_.data(), bounds_, (E + 1) * sizeof(int32_t), cudaMemcpyDeviceToHost, s_), "bounds");
+                mmq::quantize(g_, src_, xq_, L.gate_up_exps.type, D, D, rows, s_);
+                ck(cudaStreamSynchronize(s_), "bounds");
+                max_rows = 1;
+                for (int e = 0; e < E; ++e) max_rows = std::max(max_rows, h_bounds_[e + 1] - h_bounds_[e]);
+            } else {
+                // each token rounded once and written to its K sorted rows (the same bytes); the products build their
+                // tile lists on the device from bounds_, so nothing comes back to the host
+                mmq::quantize_scatter(g_, inv_, xq_, L.gate_up_exps.type, D, D, n, K, rows, s_);
+            }
+            mark(il, 5);
+            mmq::Product p;
+            p.w = L.gate_up_exps.d;
+            p.type = L.gate_up_exps.type;
+            p.w_rows = 2 * FE;
+            p.w_cols = D;
+            p.expert_bytes = L.gate_up_exps.nb2;
+            p.n = E;
+            p.xq = xq_;
+            p.bounds = bounds_;
+            p.ids = iota_;
+            p.total_rows = rows;
+            p.max_rows = max_rows;
+            p.dst = gu_;
+            p.ld_dst = 2 * FE;
+            if (legacy) mq->run(p, s_);
+            else mq->run_tiles(p, s_);
+            mark(il, 6);
+            if (legacy || !mmq::geglu_quantize(gu_, gu_ + FE, 2 * FE, xq_, L.down_exps.type, FE, rows, s_)) {
+                k::geglu(gu_, gu_ + FE, eh_, rows, FE, 2 * FE, s_);
+                mmq::quantize(eh_, nullptr, xq_, L.down_exps.type, FE, FE, rows, s_);
+            }
+            p.w = L.down_exps.d;
+            p.type = L.down_exps.type;
+            p.w_rows = D;
+            p.w_cols = FE;
+            p.expert_bytes = L.down_exps.nb2;
+            p.dst = ey_;
+            p.ld_dst = D;
+            if (legacy) mq->run(p, s_);
+            else mq->run_tiles(p, s_);
+            mark(il, 7);
         }
-        mark(il, 5);
-        mmq::Product p;
-        p.w = L.gate_up_exps.d;
-        p.type = L.gate_up_exps.type;
-        p.w_rows = 2 * FE;
-        p.w_cols = D;
-        p.expert_bytes = L.gate_up_exps.nb2;
-        p.n = E;
-        p.xq = xq_;
-        p.bounds = bounds_;
-        p.ids = iota_;
-        p.total_rows = rows;
-        p.max_rows = max_rows;
-        p.dst = gu_;
-        p.ld_dst = 2 * FE;
-        if (legacy) mq->run(p, s_);
-        else mq->run_tiles(p, s_);
-        mark(il, 6);
-        if (legacy || !mmq::geglu_quantize(gu_, gu_ + FE, 2 * FE, xq_, L.down_exps.type, FE, rows, s_)) {
-            k::geglu(gu_, gu_ + FE, eh_, rows, FE, 2 * FE, s_);
-            mmq::quantize(eh_, nullptr, xq_, L.down_exps.type, FE, FE, rows, s_);
-        }
-        p.w = L.down_exps.d;
-        p.type = L.down_exps.type;
-        p.w_rows = D;
-        p.w_cols = FE;
-        p.expert_bytes = L.down_exps.nb2;
-        p.dst = ey_;
-        p.ld_dst = D;
-        if (legacy) mq->run(p, s_);
-        else mq->run_tiles(p, s_);
-        mark(il, 7);
         if (!g_dumping) {   // combine + post in one pass (moe-glue)
             k::moe_combine_post(ey_, inv_, eid_, ew_, L.down_exps_scale ? L.down_exps_scale.f32() : nullptr, moe_, x1_,
                                 mlp_, L.post_ffw_norm_1.f32(), L.post_ffw_norm_2.f32(), L.post_ffw_norm.f32(),
