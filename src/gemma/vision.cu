@@ -126,12 +126,12 @@ __global__ void rms_i8_kernel(const float* __restrict__ x, const float* __restri
     if (threadIdx.x == 0) s[r] = scale;
 }
 
-// x += rms(y) * w; y either f32 or (W8A8) the int32 GEMM output times the row and column scales
-__global__ void add_rms_kernel(float* __restrict__ x, const float* __restrict__ y, const float* __restrict__ w, int D,
+// x += rms(y) * w; y either the bf16 GEMM output or (W8A8) the int32 GEMM output times the row and column scales
+__global__ void add_rms_kernel(float* __restrict__ x, const bf16* __restrict__ y, const float* __restrict__ w, int D,
                                float eps, const int32_t* __restrict__ yi, const float* __restrict__ sx,
                                const float* __restrict__ sw) {
     const size_t r = blockIdx.x;
-    auto yv = [&](int i) { return yi ? (float) yi[r * D + i] * sx[r] * sw[i] : y[r * D + i]; };
+    auto yv = [&](int i) { return yi ? (float) yi[r * D + i] * sx[r] * sw[i] : __bfloat162float(y[r * D + i]); };
     float ss = 0.f;
     for (int i = threadIdx.x; i < D; i += blockDim.x) { const float v = yv(i); ss += v * v; }
     ss = block_sum(ss);
@@ -139,9 +139,10 @@ __global__ void add_rms_kernel(float* __restrict__ x, const float* __restrict__ 
     for (int i = threadIdx.x; i < D; i += blockDim.x) x[r * D + i] = yv(i) * sc * w[i] + x[r * D + i];
 }
 
-// per patch (one block), a warp per (q|k|v, head) slot: rms * norm -> 2-D rope for q / k, rms for v; written f16
-// [head][n][HDP], zero-padded. hd <= 96: a lane holds elements lane, lane + 32, lane + 64.
-__global__ void vit_qkv_kernel(const float* __restrict__ qkv, const float* __restrict__ qn, const float* __restrict__ kn,
+// per patch (one block), a warp per (q|k|v, head) slot of the bf16 GEMM output (W8A8: int32 * scales): rms * norm ->
+// 2-D rope for q / k, rms for v; written f16 [head][n][HDP], zero-padded. hd <= 96: a lane holds elements lane,
+// lane + 32, lane + 64.
+__global__ void vit_qkv_kernel(const bf16* __restrict__ qkv, const float* __restrict__ qn, const float* __restrict__ kn,
                                __half* __restrict__ Q, __half* __restrict__ K, __half* __restrict__ V, int n, int H,
                                int hd, int HDP, int ncols, float eps, float theta_scale,
                                const int32_t* __restrict__ qi, const float* __restrict__ sx, const float* __restrict__ sw) {
@@ -154,7 +155,7 @@ __global__ void vit_qkv_kernel(const float* __restrict__ qkv, const float* __res
     for (int slot = warp; slot < 3 * H; slot += 8) {
         const int which = slot / H, h = slot % H;
         const size_t col0 = (size_t) which * H * hd + (size_t) h * hd;   // W8A8: int32 * row scale * column scale
-        const float* src = qkv + (size_t) g * 3 * H * hd + col0;
+        const bf16* src = qkv + (size_t) g * 3 * H * hd + col0;
         const int32_t* srci = qi ? qi + (size_t) g * 3 * H * hd + col0 : nullptr;
         const float rs = qi ? sx[g] : 0.f;
         float v[3];
@@ -162,7 +163,7 @@ __global__ void vit_qkv_kernel(const float* __restrict__ qkv, const float* __res
 #pragma unroll
         for (int c = 0; c < 3; ++c) {
             const int i = lane + 32 * c;
-            v[c] = i < hd ? (srci ? (float) srci[i] * rs * sw[col0 + i] : src[i]) : 0.f;
+            v[c] = i < hd ? (srci ? (float) srci[i] * rs * sw[col0 + i] : __bfloat162float(src[i])) : 0.f;
             ss += v[c] * v[c];
         }
 #pragma unroll
@@ -218,11 +219,11 @@ __global__ void geglu_i8_kernel(const int32_t* __restrict__ gu, const float* __r
     if (threadIdx.x == 0) s[r] = scale;
 }
 
-__global__ void geglu_quick_kernel(const float* __restrict__ gu, bf16* __restrict__ h, int64_t n, int F) {
+__global__ void geglu_quick_kernel(const bf16* __restrict__ gu, bf16* __restrict__ h, int64_t n, int F) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n * F) return;
     const int64_t r = i / F, c = i % F;
-    const float g = gu[r * 2 * F + c], u = gu[r * 2 * F + F + c];
+    const float g = __bfloat162float(gu[r * 2 * F + c]), u = __bfloat162float(gu[r * 2 * F + F + c]);
     h[i] = __float2bfloat16(g * (1.0f / (1.0f + expf(-1.702f * g))) * u);
 }
 
@@ -560,7 +561,8 @@ struct Vision::Impl {
     int max_n = 0;
     uint8_t* img = nullptr;
     __half* patches = nullptr;
-    float *x = nullptr, *y = nullptr, *qkv = nullptr, *gu = nullptr, *outv = nullptr;
+    float *x = nullptr, *outv = nullptr;
+    bf16 *y = nullptr, *qkv = nullptr, *gu = nullptr;   // GEMM outputs (bf16; int32 in the int8 path's GEMMs)
     bf16 *hb = nullptr, *ab = nullptr, *fb = nullptr;
     int8_t* hq = nullptr;                    // int8: a GEMM input [N][<= F]
     float *sx1 = nullptr, *sx2 = nullptr;    // int8: its row scales (gate / up input, down input)
@@ -737,8 +739,9 @@ Vision::Vision(const std::string& path, int tokens, int max_patches, bool int8) 
     const size_t D = m.D, F = m.F;
     size_t off = 0;
     auto carve = [&](size_t bytes) { off = (off + 255) / 256 * 256; const size_t o = off; off += bytes; return o; };
+    const size_t yb = m.i8 ? 4 : 2;   // GEMM output element: bf16, or int32 where the int8 path's GEMMs write
     const size_t b_img = carve((size_t) N * m.P * m.P * 3), b_patch = carve((size_t) N * 3 * m.P * m.P * 2),
-                 b_x = carve(N * D * 4), b_y = carve(N * D * 4), b_qkv = carve(N * 3 * D * 4), b_gu = carve(N * 2 * F * 4),
+                 b_x = carve(N * D * 4), b_y = carve(N * D * yb), b_qkv = carve(N * 3 * D * yb), b_gu = carve(N * 2 * F * yb),
                  b_out = carve((size_t) N * m.n_out * 4), b_hb = carve(N * D * 2), b_ab = carve(N * D * 2),
                  b_fb = carve(N * F * 2), b_q = carve((size_t) m.H * N * Impl::HDP * 2),
                  b_k = carve((size_t) m.H * N * Impl::HDP * 2), b_v = carve((size_t) m.H * N * Impl::HDP * 2);
@@ -749,9 +752,9 @@ Vision::Vision(const std::string& path, int tokens, int max_patches, bool int8) 
     m.img = w8(b_img);
     m.patches = reinterpret_cast<__half*>(w8(b_patch));
     m.x = reinterpret_cast<float*>(w8(b_x));
-    m.y = reinterpret_cast<float*>(w8(b_y));
-    m.qkv = reinterpret_cast<float*>(w8(b_qkv));
-    m.gu = reinterpret_cast<float*>(w8(b_gu));
+    m.y = reinterpret_cast<bf16*>(w8(b_y));
+    m.qkv = reinterpret_cast<bf16*>(w8(b_qkv));
+    m.gu = reinterpret_cast<bf16*>(w8(b_gu));
     m.outv = reinterpret_cast<float*>(w8(b_out));
     m.hb = reinterpret_cast<bf16*>(w8(b_hb));
     m.ab = reinterpret_cast<bf16*>(w8(b_ab));
@@ -848,11 +851,12 @@ int Vision::encode_batch(const std::vector<const ImageU8*>& imgs, std::vector<fl
     patchify_kernel<<<N, 256, 0, s>>>(m.img, img.nx, P, ncols, m.patches, n);
     kcheck("patchify");
     const float one = 1.f, zero = 0.f;
-    // Y [n][out] = X [n][in] . W [out][in]^T
-    auto gemm = [&](const void* W, cudaDataType wt, const void* X, cudaDataType xt, float* Y, int rows, int out_d, int in_d,
-                    const char* what) {
+    // Y [n][out] = X [n][in] . W [out][in]^T, accumulated in f32; Y bf16 in the layers (as transformers runs the
+    // encoder; the residual stream stays f32), f32 for the patch embedding and the projection
+    auto gemm = [&](const void* W, cudaDataType wt, const void* X, cudaDataType xt, void* Y, cudaDataType yt, int rows,
+                    int out_d, int in_d, const char* what) {
         cb(cublasGemmEx(m.blas, CUBLAS_OP_T, CUBLAS_OP_N, out_d, rows, in_d, &one, W, wt, in_d, X, xt, in_d, &zero, Y,
-                        CUDA_R_32F, out_d, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT), what);
+                        yt, out_d, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT), what);
     };
     // W8A8: Y [n][out] int32 = Xq [n][in] . Wq [out][in]^T (scales applied by the consumer kernels)
     auto gemm8 = [&](const int8_t* W, const int8_t* X, int32_t* Y, int rows, int out_d, int in_d, const char* what) {
@@ -860,7 +864,7 @@ int Vision::encode_batch(const std::vector<const ImageU8*>& imgs, std::vector<fl
         cb(cublasGemmEx(m.blas, CUBLAS_OP_T, CUBLAS_OP_N, out_d, rows, in_d, &i1, W, CUDA_R_8I, in_d, X, CUDA_R_8I, in_d,
                         &i0, Y, CUDA_R_32I, out_d, CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT), what);
     };
-    gemm(m.patch_w, CUDA_R_16F, m.patches, CUDA_R_16F, m.x, N, D, 3 * P * P, "patch");
+    gemm(m.patch_w, CUDA_R_16F, m.patches, CUDA_R_16F, m.x, CUDA_R_32F, N, D, 3 * P * P, "patch");
     add_pos_kernel<<<N, 256, 0, s>>>(m.x, m.pos, m.pos_size, D, ncols, n);
     kcheck("add_pos");
     float theta_scale = powf(m.theta, -2.0f / (float) (hd / 2));
@@ -878,7 +882,7 @@ int Vision::encode_batch(const std::vector<const ImageU8*>& imgs, std::vector<fl
         if (m.i8)
             gemm8(L.q8qkv, m.hq, reinterpret_cast<int32_t*>(m.qkv), N, 3 * D, D, "qkv8");
         else
-            gemm(L.wqkv, CUDA_R_16BF, m.hb, CUDA_R_16BF, m.qkv, N, 3 * D, D, "qkv");
+            gemm(L.wqkv, CUDA_R_16BF, m.hb, CUDA_R_16BF, m.qkv, CUDA_R_16BF, N, 3 * D, D, "qkv");
         m.mark(il, 2, s);
         vit_qkv_kernel<<<N, 256, 0, s>>>(m.qkv, L.qn, L.kn, m.Qh, m.Kh, m.Vh, n, H, hd, Impl::HDP, ncols, m.eps,
                                           theta_scale, m.i8 ? reinterpret_cast<const int32_t*>(m.qkv) : nullptr,
@@ -888,7 +892,7 @@ int Vision::encode_batch(const std::vector<const ImageU8*>& imgs, std::vector<fl
         vit_fa2_kernel<Impl::HDP><<<dim3((n + 63) / 64, H, B), 128, 0, s>>>(m.Qh, m.Kh, m.Vh, m.ab, n, H, hd);
         kcheck("vit_fa");
         m.mark(il, 4, s);
-        gemm(L.wo, CUDA_R_16BF, m.ab, CUDA_R_16BF, m.y, N, D, D, "attn_out");
+        gemm(L.wo, CUDA_R_16BF, m.ab, CUDA_R_16BF, m.y, CUDA_R_16BF, N, D, D, "attn_out");
         m.mark(il, 5, s);
         add_rms_kernel<<<N, 256, 0, s>>>(m.x, m.y, L.post_attn, D, m.eps, nullptr, nullptr, nullptr);
         if (m.i8) {
@@ -906,11 +910,11 @@ int Vision::encode_batch(const std::vector<const ImageU8*>& imgs, std::vector<fl
         } else {
             rms_bf16_kernel<<<N, 256, 0, s>>>(m.x, L.ln2, m.hb, D, m.eps);
             m.mark(il, 6, s);
-            gemm(L.wgu, CUDA_R_16BF, m.hb, CUDA_R_16BF, m.gu, N, 2 * F, D, "gate_up");
+            gemm(L.wgu, CUDA_R_16BF, m.hb, CUDA_R_16BF, m.gu, CUDA_R_16BF, N, 2 * F, D, "gate_up");
             m.mark(il, 7, s);
             geglu_quick_kernel<<<nblk((int64_t) N * F), 256, 0, s>>>(m.gu, m.fb, N, F);
             m.mark(il, 8, s);
-            gemm(L.wdown, CUDA_R_16BF, m.fb, CUDA_R_16BF, m.y, N, D, F, "down");
+            gemm(L.wdown, CUDA_R_16BF, m.fb, CUDA_R_16BF, m.y, CUDA_R_16BF, N, D, F, "down");
             m.mark(il, 9, s);
             add_rms_kernel<<<N, 256, 0, s>>>(m.x, m.y, L.post_ffn, D, m.eps, nullptr, nullptr, nullptr);
         }
@@ -921,7 +925,7 @@ int Vision::encode_batch(const std::vector<const ImageU8*>& imgs, std::vector<fl
     pool_kernel<<<T, 256, D * sizeof(float), s>>>(m.x, ncols, m.merge, D, sqrtf((float) D), m.std_bias, m.std_scale,
                                                  m.hb, m.eps, n, n_tok);
     kcheck("pool");
-    gemm(m.proj, CUDA_R_16BF, m.hb, CUDA_R_16BF, m.outv, T, m.n_out, D, "projection");
+    gemm(m.proj, CUDA_R_16BF, m.hb, CUDA_R_16BF, m.outv, CUDA_R_32F, T, m.n_out, D, "projection");
     const size_t base = out.size();
     out.resize(base + (size_t) T * m.n_out);
     ck(cudaMemcpyAsync(out.data() + base, m.outv, (size_t) T * m.n_out * sizeof(float), cudaMemcpyDeviceToHost, s), "download");

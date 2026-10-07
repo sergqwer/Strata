@@ -6,9 +6,10 @@
 //          base 100); v = rms_head; a = softmax(q k^T) v (scale 1, every patch sees every patch);
 //          x += rms(Wo a) attn_post_norm;  x += rms(Wdown (gelu_quick(Wgate h') * Wup h')) ffn_post_norm ]
 //   3x3 average pool -> * sqrt(n_embd) -> (x - std_bias) * std_scale -> rms -> input projection to the LM width.
-// The matrices are BF16 (activations are rounded to BF16 for the GEMMs, as ggml's cuBLAS path does); attention runs
-// in an own flash-attention kernel on tensor cores (head_dim 72, padded to 80), where llama.cpp falls back to a
-// generic tile kernel that took half of its encode time.
+// The matrices are BF16 (activations are rounded to BF16 for the GEMMs, as ggml's cuBLAS path does; the layers' GEMMs
+// write BF16 too, accumulated in FP32, as transformers runs the encoder, while the residual stream stays FP32);
+// attention runs in an own flash-attention kernel on tensor cores (head_dim 72, padded to 80), where llama.cpp falls
+// back to a generic tile kernel that took half of its encode time.
 #pragma once
 
 #include "strata/gemma/image.hpp"
