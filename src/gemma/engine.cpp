@@ -3,6 +3,7 @@
 
 #include "strata/gemma/kernels.hpp"
 #include "strata/gemma/mmq.hpp"
+#include "strata/gemma/moe_w4a16.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 
 #include <cublas_v2.h>
@@ -110,7 +111,7 @@ Engine::Engine(const Model& m, int ctx, int max_batch) : m_(m), ctx_(ctx), max_b
         rlog_ = carve<float>(N * E);
         ew_ = carve<float>(N * K);
         eid_ = carve<int32_t>(N * K);
-        gu_ = carve<float>(N * K * 2 * FE);
+        gu_ = carve<float>(std::max(N * K * 2 * FE, (N * K * D + 1) / 2));   // also the w4a16 path's fp16 expert inputs
         eh_ = carve<float>(N * K * FE);
         ey_ = carve<float>(N * K * D);
         bounds_ = carve<int32_t>(E + 1);
@@ -161,6 +162,23 @@ Engine::~Engine() {
     delete (mmq::Context*) mmq_;
     if (arena_) cudaFree(arena_);
     if (s_) cudaStreamDestroy(s_);
+}
+
+bool Engine::set_moe_w4a16(bool on) {
+    w4a16_ = false;
+    if (!on) return false;
+    const Config& c = m_.cfg;
+    for (const Layer& L : m_.layers) {
+        if (!L.moe()) continue;
+        if (!w4a16::supported(L.gate_up_exps.type, L.down_exps.type, c.n_embd, c.n_ff_exp, L.gate_up_exps.nb1,
+                              L.down_exps.nb1, L.gate_up_exps.d, L.down_exps.d, L.gate_up_exps.nb2, L.down_exps.nb2) ||
+            L.gate_up_exps.ne[1] != 2 * c.n_ff_exp || L.down_exps.ne[1] != c.n_embd) {
+            std::fprintf(stderr, "strata: --moe-w4a16: these expert tensors are not covered (moe_w4a16.cu supported()): off\n");
+            return false;
+        }
+    }
+    w4a16_ = true;
+    return true;
 }
 
 std::vector<int32_t> Engine::debug_expert_ids(int rows) const {
@@ -546,6 +564,18 @@ void Engine::layer_big(int il, int n) {
         dump("ffn_moe_weights_norm", il, ew_, K, n, s_);
         k::moe_sort(eid_, n, K, E, bounds_, src_, inv_, counts_, s_);
         const int64_t rows = (int64_t) n * K;
+        if (w4a16_) {
+            // fp16 expert inputs (one copy per chosen expert, sorted) -> gate_up with the GeGLU in its epilogue -> fp16
+            // hidden -> down -> ey_, all on the device (no host sync): xs lives in gu_, the hidden in eh_
+            __half* xs = reinterpret_cast<__half*>(gu_);
+            __half* hid = reinterpret_cast<__half*>(eh_);
+            w4a16::scatter(g_, D, inv_, n, K, xs, s_);
+            mark(il, 5);
+            w4a16::gate_up(L.gate_up_exps.d, L.gate_up_exps.nb1, L.gate_up_exps.nb2, D, FE, xs, bounds_, E, rows, hid, s_);
+            mark(il, 6);
+            w4a16::down(L.down_exps.d, L.down_exps.nb1, L.down_exps.nb2, FE, D, hid, bounds_, E, rows, ey_, s_);
+            mark(il, 7);
+        } else {   // q8_1 + MMQ (the default; the block is left at its old indentation to keep the diff small)
         // MMQ's grid spans max_rows tokens per expert; with every expert sized for all n tokens, its stream-k split
         // hands most blocks empty tiles (4-5x slower). The bounds come back to the host for the true maximum.
         h_bounds_.resize(E + 1);
@@ -582,6 +612,7 @@ void Engine::layer_big(int il, int n) {
         p.ld_dst = D;
         mq->run(p, s_);
         mark(il, 7);
+        }
         k::moe_combine(ey_, inv_, eid_, ew_, L.down_exps_scale ? L.down_exps_scale.f32() : nullptr, moe_, D, n, K, s_);
         dump("moe_raw", il, moe_, D, n, s_);
     }

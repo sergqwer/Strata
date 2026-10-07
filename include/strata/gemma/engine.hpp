@@ -78,6 +78,11 @@ public:
     const float* logits_dev() const { return logits_; }
     /// CUDA graphs for the decode path (default on; STRATA_NO_GRAPH=1 turns them off).
     void set_graphs(bool on) { graphs_ = on; }
+    /// The prompt path's expert GEMMs on the fp16 tensor cores straight from the Q4_0 experts (moe_w4a16.hpp: fp16
+    /// expert inputs instead of q8_1, GeGLU fused into gate_up, no per-layer host sync) instead of q8_1 + MMQ. Off by
+    /// default; returns whether it is on (false when a MoE layer's expert tensors are not covered).
+    bool set_moe_w4a16(bool on);
+    bool moe_w4a16() const { return w4a16_; }
     /// Time the prompt path's phases with CUDA events (one forward after another; for diagnosis): milliseconds per
     /// phase summed over the layers and the forwards since the last profile_take().
     void set_profile(bool on) { prof_ = on; }
@@ -128,6 +133,7 @@ private:
     void *xqf_ = nullptr, *xqg_ = nullptr, *xqh_ = nullptr, *xqe_ = nullptr;
     int n_scored_ = 0, logits_row_ = -1, n_split_ = 1;
     bool graphs_ = true;
+    bool w4a16_ = false;              // set_moe_w4a16
     std::vector<void*> graph_exec_;   // [(n * 3 + mode) * 2 + subset head]: cudaGraphExec_t of run_small
     std::vector<int32_t> head_ids_;   // set_head_rows: the scored vocabulary rows (empty: all)
     void* head_w_ = nullptr;          // their head rows gathered back to back, padded to kHeadRows (the last row repeated)

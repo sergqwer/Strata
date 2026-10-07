@@ -23,13 +23,15 @@
 //   strata-gemma-server -m model.gguf --mmproj mmproj.gguf [--host 0.0.0.0] [--port 8091] [--api-key-file F]
 //                       [--ctx 4096] [--batch 2048] [--image-tokens 280] [--max-image-tokens 560]
 //                       [--mtp mtp.gguf --draft 3] [--max-queue N] [--slots N] [--mtp-slots M]
-//                       [--prefix-cache-mb 0] [--prefix-max-tokens 768] [--full-head]
+//                       [--prefix-cache-mb 0] [--prefix-max-tokens 768] [--full-head] [--moe-w4a16]
 // --max-image-tokens sizes the vision work buffers for the largest per-request "image_tokens" (~90 KB a patch).
 // Under a grammar whose characters are a plain list (the compact answers: digits, spaces, ';', '-', A-H) the head
 // scores only the vocabulary rows made of them (~500 of 262144; 0.6 GB less read a decode step) - the same choice, as
 // the grammar takes the best token it allows. --full-head scores every row anyway.
 // --vision-int8: the vision encoder's q/k/v, gate/up and down matrices as per-row int8, their GEMMs on the int8 tensor
 //                cores with per-patch activation scales (W8A8); ~1/3 off those GEMMs, accuracy equal on 416 held-out tasks.
+// --moe-w4a16: the prompt path's expert GEMMs on the fp16 tensor cores straight from the Q4_0 experts (fp16 expert
+//              inputs instead of q8_1, GeGLU fused into gate_up, no per-layer host sync; Engine::set_moe_w4a16).
 #include "strata/gemma/engine.hpp"
 #include "strata/gemma/image.hpp"
 #include "strata/gemma/model.hpp"
@@ -724,6 +726,7 @@ int main(int argc, char** argv) {
     int port = 8091, ctx = 4096, batch = 2048, img_tokens = 280, max_img_tokens = 280;
     bool full_head = false;     // --full-head: no grammar-subset head (for A/B)
     bool vision_int8 = false;   // --vision-int8: the encoder's q/k/v, gate/up, down GEMMs as W8A8 (int8 tensor cores)
+    bool moe_w4a16 = false;     // --moe-w4a16: the prompt path's expert GEMMs as w4a16 (fp16 tensor cores) instead of MMQ
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() {
@@ -744,6 +747,7 @@ int main(int argc, char** argv) {
         else if (a == "--max-image-tokens") max_img_tokens = std::stoi(next());
         else if (a == "--vision-int8") vision_int8 = true;
         else if (a == "--full-head") full_head = true;
+        else if (a == "--moe-w4a16") moe_w4a16 = true;
         else if (a == "--slots") slots = std::max(1, std::stoi(next()));
         else if (a == "--mtp-slots") mtp_slots = std::max(0, std::stoi(next()));
         else if (a == "--mtp") mtp_path = next();
@@ -791,6 +795,8 @@ int main(int argc, char** argv) {
         S.n_draft = n_draft;
         for (int k = 0; k < slots; ++k) {
             S.engines.emplace_back(new Engine(*S.model, ctx, batch));
+            if (moe_w4a16 && S.engines.back()->set_moe_w4a16(true) && k == 0)
+                std::fprintf(stderr, "prompt experts: w4a16 (fp16 tensor cores, Q4_0 in place)\n");
             S.mtps.emplace_back(!mtp_path.empty() && k < mtp_slots
                                     ? new Mtp(mtp_path, *S.model, *S.engines.back(), Engine::kSmall - 1) : nullptr);
             std::fprintf(stderr, "engine slot %d: ctx %d, batch %d, %.2f GiB of buffers, mtp %s\n", k, ctx, batch,

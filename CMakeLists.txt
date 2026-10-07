@@ -62,6 +62,7 @@ add_library(strata_gemma STATIC
   src/gemma/engine.cpp
   src/gemma/mtp.cpp
   src/gemma/kernels.cu
+  src/gemma/moe_w4a16.cu
   src/gemma/image.cpp
   src/gemma/vision.cu
   src/kernels/cuda/native_mmvq.cu
