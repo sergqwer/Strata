@@ -1,5 +1,5 @@
 Standalone harness for the vision encoder's attention (head_dim 72): the old `vit_fa2_kernel` (`cur.cuh`), the
-candidates (`fa3.cuh`, `fa4.cuh`) and the kernel as it went into `vision.cu` (`prod.cuh`), checked against an FP32
+candidate (`fa3.cuh`) and the kernel as it went into `vision.cu` (`prod.cuh`), checked against an FP32
 (double-sum) reference and timed (min over reps). `peak_mma.cu` measures the card's m16n8k16 ceiling at its clock.
 
     nvcc -O3 -arch=sm_86 -use_fast_math -std=c++17 harness.cu -o harness

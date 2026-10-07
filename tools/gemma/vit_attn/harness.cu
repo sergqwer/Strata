@@ -17,7 +17,6 @@ using bf16 = __nv_bfloat16;
 
 #include "cur.cuh"
 #include "fa3.cuh"
-#include "fa4.cuh"
 #include "prod.cuh"
 
 constexpr int H = 16, HD = 72, HDP = 80;
@@ -87,19 +86,6 @@ void launch_fa3(const __half* q, const __half* k, const __half* v, void* o, int 
     if (f32) xp::fa3_kernel<NW, MT, BK, ST, MINB, float><<<grid, NW * 32, SM, s>>>(q, k, v, (float*) o, n, H);
     else xp::fa3_kernel<NW, MT, BK, ST, MINB, bf16><<<grid, NW * 32, SM, s>>>(q, k, v, (bf16*) o, n, H);
 }
-template <int NW, int MT, int BK, int ST, int MINB>
-void launch_fa4(const __half* q, const __half* k, const __half* v, void* o, int n, int B, bool f32, cudaStream_t s) {
-    constexpr int QB = NW * 16 * MT, SM = ST * 2 * BK * 72 * 2;
-    static bool init = false;
-    if (!init) {
-        CK(cudaFuncSetAttribute(xp::fa4_kernel<NW, MT, BK, ST, MINB, bf16>, cudaFuncAttributeMaxDynamicSharedMemorySize, SM));
-        CK(cudaFuncSetAttribute(xp::fa4_kernel<NW, MT, BK, ST, MINB, float>, cudaFuncAttributeMaxDynamicSharedMemorySize, SM));
-        init = true;
-    }
-    dim3 grid((n + QB - 1) / QB, H, B);
-    if (f32) xp::fa4_kernel<NW, MT, BK, ST, MINB, float><<<grid, NW * 32, SM, s>>>(q, k, v, (float*) o, n, H);
-    else xp::fa4_kernel<NW, MT, BK, ST, MINB, bf16><<<grid, NW * 32, SM, s>>>(q, k, v, (bf16*) o, n, H);
-}
 void launch_prod(const __half* q, const __half* k, const __half* v, void* o, int n, int B, bool f32, cudaStream_t s) {
     // the vision.cu kernel writes bf16 only: the f32 slot gets the bf16 result widened (compare its bf16 numbers)
     static bf16* tmp = nullptr;
@@ -119,7 +105,6 @@ void launch_cur(const __half* q, const __half* k, const __half* v, void* o, int 
     else cur_fa2_kernel<HDP, bf16><<<grid, 128, 0, s>>>(q, k, v, (bf16*) o, n, H, HD);
 }
 
-#define FA4(NW, MT, BK, ST, MINB) Cfg{"fa4 w" #NW " m" #MT " bk" #BK " st" #ST " b" #MINB, NW * 16 * MT, NW * 32, ST * 2 * BK * 144, launch_fa4<NW, MT, BK, ST, MINB>}
 #define FA3(NW, MT, BK, ST, MINB) Cfg{"fa3 w" #NW " m" #MT " bk" #BK " st" #ST " b" #MINB, NW * 16 * MT, NW * 32, ST * 2 * BK * 144, launch_fa3<NW, MT, BK, ST, MINB>}
 
 static float bf2f(bf16 x) { return __bfloat162float(x); }
