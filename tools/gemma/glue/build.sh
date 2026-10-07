@@ -20,3 +20,11 @@ nvcc $F -I. -I$R/include -c glue_bench.cu -o obj/glue_bench.o &
 wait
 nvcc $F obj/glue_bench.o obj/old_k.o obj/old_mmvq.o obj/kernels.o obj/native_mmvq.o obj/iq_kernels.o $EXTRA -o glue_bench
 echo built glue_bench
+
+# mmq_order: the expert GEMM on two sort orders (links the engine's MMQ build: run cmake + make strata_mmq first)
+if [ "$1" = "mmq_order" ]; then
+  B=$R/build
+  nvcc $F -I. -I$R/include -c mmq_order.cu -o obj/mmq_order.o
+  nvcc $F obj/mmq_order.o obj/old_k.o -o mmq_order $B/libstrata_mmq.a $B/llama.cpp/ggml/src/libggml-base.a -lcublas -lcublasLt -lpthread -ldl
+  echo built mmq_order
+fi
