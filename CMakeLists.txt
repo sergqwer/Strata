@@ -60,6 +60,7 @@ target_link_libraries(strata_mmq PUBLIC ggml-base CUDA::cudart)
 add_library(strata_gemma STATIC
   src/gemma/model.cpp
   src/gemma/engine.cpp
+  src/gemma/decode.cpp
   src/gemma/mtp.cpp
   src/gemma/kernels.cu
   src/gemma/image.cpp

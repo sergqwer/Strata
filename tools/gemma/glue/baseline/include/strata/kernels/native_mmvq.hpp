@@ -125,18 +125,4 @@ std::size_t native_mmvq_groups_bytes();
 void native_mmvq_group_ids(const int32_t* ids, int n_pairs, void* groups, void* stream);
 void native_mmvq_grouped(int ggml_type, const void* w_base, std::size_t expert_bytes, const void* groups, int n_pairs,
                          const void* x_q8_1, int x_div, float* y, int n_in, int n_out, void* stream);
-
-/// strata-gemma (moe-glue): single-column products of Q4_0 / Q5_0 / Q8_0 / IQ4_NL (native_mmvq with ncols == 1,
-/// native_mmvq_id) run a warp-per-row layout with bitwise the same per-row arithmetic as the 128-thread kernels
-/// (STRATA_OLD_MMVQ=1 or STRATA_OLD_GLUE=1 at startup: the old kernels). Read once; captured graphs keep their kernels.
-bool native_mmvq_vt();
-/// The harness: rows per warp of the warp-per-row kernels (0: the default per shape; 1, 2 or 4).
-void native_mmvq_set_vt_rows(int rows);
-/// strata-gemma (moe-glue): up to 4 matrices of one type that read the same single activation column (x_q8_1, n_in
-/// values) in one launch: y[j] (n_out[j] floats) = w[j] x, each bitwise what native_mmvq(type, w[j], x, y[j], n_in,
-/// n_out[j], 1) gives. q / k / v and gate / up of a decode step. Without native_mmvq_vt() (or for another type) it
-/// is that many native_mmvq calls.
-bool native_mmvq_multi_w_supported(int ggml_type) noexcept;
-void native_mmvq_multi_w(int ggml_type, int n_mats, const void* const* w, float* const* y, const int* n_out,
-                         const void* x_q8_1, int n_in, void* stream);
 } // namespace strata::kernels

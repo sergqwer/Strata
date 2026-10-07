@@ -98,6 +98,9 @@ private:
     const int ctx_, max_batch_;
     int n_past_ = 0;
     cudaStream_t s_ = nullptr;
+    cudaStream_t side_ = nullptr;             // the decode layer's FFN fork (decode.hpp; STRATA_NO_FORK=1: one stream)
+    cudaEvent_t ev_fork_ = nullptr, ev_join_ = nullptr;
+    bool fork_ = true;
     void* cublas_ = nullptr;
     void* mmq_ = nullptr;
 

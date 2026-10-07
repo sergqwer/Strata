@@ -92,18 +92,6 @@ void key_ranges(const int32_t* pos, int rows, int n_swa, bool swa, const int32_t
 /// iota: dst[i] = i.
 void iota(int32_t* dst, int n, cudaStream_t s);
 
-/// moe-glue (prompt path), each bitwise what the old calls give (tools/gemma/glue); STRATA_OLD_GLUE=1: the old calls.
-/// moe_sort with the expert scan in parallel (the old one was one thread walking the experts).
-void moe_sort2(const int32_t* ids, int rows, int k, int n_expert, int32_t* bounds, int32_t* src, int32_t* inv,
-               int32_t* counts, cudaStream_t s);
-/// moe_combine then ffn_post in one pass for k = 8 (moe: the combined rows' buffer, used only by the fallback).
-void moe_combine_post(const float* y, const int32_t* inv, const int32_t* ids, const float* w, const float* scale,
-                      float* moe, const float* x1, const float* mlp, const float* pn1, const float* pn2, const float* pfn,
-                      float out_scale, float* x_out, int n, int rows, int k, float eps, cudaStream_t s);
-/// add_rms (x1 = x + rms(y) * w_pa) then ffn_norms(x1) in one pass.
-void add_rms_ffn_norms(const float* x, const float* y, const float* w_pa, float* x1, const float* w_f, const float* w_g,
-                       const float* w_r, float* f, float* g, float* r, int n, int rows, float eps, cudaStream_t s);
-
 }  // namespace strata::gemma::k
 
 // ---- the decode path's fused kernels (rows <= a few; one block of 1024 threads per row). q8_1 outputs are
@@ -144,25 +132,6 @@ void attn_combine_quant(const void* part, float* out, void* xq, int rows, int n_
 /// attn_decode's first half only (the split partials), for attn_combine_quant.
 void attn_partials(const float* q, const __half* kc, const __half* vc, const int32_t* lo, const int32_t* hi,
                    void* scratch, int rows, int n_head, int n_kv, int hd, int n_split, cudaStream_t s);
-
-/// moe-glue: STRATA_OLD_GLUE=1 at startup - every glue path below falls back to the old kernels (read once).
-bool glue_off();
-/// moe-glue: post_attn_fused, moe_post_fused (k = 8), router_gemv and router_topk with bitwise the same results
-/// (tools/gemma/glue): loads issued up front, q8_1 from registers, router rows spread over the SMs, the top-k picks
-/// by warp reductions. n <= 3072 (else, and with glue_off(), the old kernels run).
-void post_attn_fused2(const float* x, const float* y, const float* w_pa, float* x1, const float* w_f, void* xqf,
-                      const float* w_g, void* xqg, const float* w_r, float* r, int n, int rows, float eps,
-                      cudaStream_t s);
-void moe_post_fused2(const float* ey, const int32_t* ids, const float* ew, const float* scale, int k, const float* mlp,
-                     const float* x1, const float* pn1, const float* pn2, const float* pfn, float out_scale, float* x_out,
-                     const float* w_next, void* xq, int n, int rows, float eps, cudaStream_t s, float* h_out = nullptr);
-void router_gemv2(const float* W, const float* r, float* logits, int n_expert, int n, int rows, cudaStream_t s);
-void router_topk2(const float* logits, int n_expert, int k, int rows, int32_t* ids, float* w, cudaStream_t s);
-/// moe-glue: attn_partials with each warp's next keys' K / V rows loaded ahead; bitwise the same partials.
-void attn_partials2(const float* q, const __half* kc, const __half* vc, const int32_t* lo, const int32_t* hi,
-                    void* scratch, int rows, int n_head, int n_kv, int hd, int n_split, cudaStream_t s);
-/// The harness: keys loaded ahead per warp (1 = default, 2, 3, 4).
-void set_attn_prefetch(int pf);
 
 /// ids[r] = argmax of row r (n values)
 void argmax_rows(const float* x, int64_t n, int rows, int32_t* ids, cudaStream_t s);
