@@ -534,8 +534,11 @@ void Engine::layer_big(int il, int n) {
     dense(L.ffn_gate, xq_, n, gate_);
     if (L.ffn_up.type != L.ffn_gate.type) mmq::quantize(f_, nullptr, xq_, L.ffn_up.type, D, D, n, s_);
     dense(L.ffn_up, xq_, n, up_);
-    k::geglu(gate_, up_, hid_, n, c.n_ff, c.n_ff, s_);
-    mmq::quantize(hid_, nullptr, xq_, L.ffn_down.type, c.n_ff, c.n_ff, n, s_);
+    static const bool legacy = mmq::legacy();   // STRATA_MMQ_LEGACY=1: the path before the tile list, byte for byte
+    if (legacy || !mmq::geglu_quantize(gate_, up_, c.n_ff, xq_, L.ffn_down.type, c.n_ff, n, s_)) {
+        k::geglu(gate_, up_, hid_, n, c.n_ff, c.n_ff, s_);
+        mmq::quantize(hid_, nullptr, xq_, L.ffn_down.type, c.n_ff, c.n_ff, n, s_);
+    }
     dense(L.ffn_down, xq_, n, mlp_);
     mark(il, 4);
 
@@ -546,14 +549,21 @@ void Engine::layer_big(int il, int n) {
         dump("ffn_moe_weights_norm", il, ew_, K, n, s_);
         k::moe_sort(eid_, n, K, E, bounds_, src_, inv_, counts_, s_);
         const int64_t rows = (int64_t) n * K;
-        // MMQ's grid spans max_rows tokens per expert; with every expert sized for all n tokens, its stream-k split
-        // hands most blocks empty tiles (4-5x slower). The bounds come back to the host for the true maximum.
-        h_bounds_.resize(E + 1);
-        ck(cudaMemcpyAsync(h_bounds_.data(), bounds_, (E + 1) * sizeof(int32_t), cudaMemcpyDeviceToHost, s_), "bounds");
-        mmq::quantize(g_, src_, xq_, L.gate_up_exps.type, D, D, rows, s_);
-        ck(cudaStreamSynchronize(s_), "bounds");
-        int max_rows = 1;
-        for (int e = 0; e < E; ++e) max_rows = std::max(max_rows, h_bounds_[e + 1] - h_bounds_[e]);
+        int max_rows = 0;
+        if (legacy) {
+            // MMQ's grid spans max_rows tokens per expert; with every expert sized for all n tokens, its stream-k split
+            // hands most blocks empty tiles (4-5x slower). The bounds come back to the host for the true maximum.
+            h_bounds_.resize(E + 1);
+            ck(cudaMemcpyAsync(h_bounds_.data(), bounds_, (E + 1) * sizeof(int32_t), cudaMemcpyDeviceToHost, s_), "bounds");
+            mmq::quantize(g_, src_, xq_, L.gate_up_exps.type, D, D, rows, s_);
+            ck(cudaStreamSynchronize(s_), "bounds");
+            max_rows = 1;
+            for (int e = 0; e < E; ++e) max_rows = std::max(max_rows, h_bounds_[e + 1] - h_bounds_[e]);
+        } else {
+            // each token rounded once and written to its K sorted rows (the same bytes); the products build their
+            // tile lists on the device from bounds_, so nothing comes back to the host
+            mmq::quantize_scatter(g_, inv_, xq_, L.gate_up_exps.type, D, D, n, K, rows, s_);
+        }
         mark(il, 5);
         mmq::Product p;
         p.w = L.gate_up_exps.d;
@@ -569,10 +579,13 @@ void Engine::layer_big(int il, int n) {
         p.max_rows = max_rows;
         p.dst = gu_;
         p.ld_dst = 2 * FE;
-        mq->run(p, s_);
+        if (legacy) mq->run(p, s_);
+        else mq->run_tiles(p, s_);
         mark(il, 6);
-        k::geglu(gu_, gu_ + FE, eh_, rows, FE, 2 * FE, s_);
-        mmq::quantize(eh_, nullptr, xq_, L.down_exps.type, FE, FE, rows, s_);
+        if (legacy || !mmq::geglu_quantize(gu_, gu_ + FE, 2 * FE, xq_, L.down_exps.type, FE, rows, s_)) {
+            k::geglu(gu_, gu_ + FE, eh_, rows, FE, 2 * FE, s_);
+            mmq::quantize(eh_, nullptr, xq_, L.down_exps.type, FE, FE, rows, s_);
+        }
         p.w = L.down_exps.d;
         p.type = L.down_exps.type;
         p.w_rows = D;
@@ -580,7 +593,8 @@ void Engine::layer_big(int il, int n) {
         p.expert_bytes = L.down_exps.nb2;
         p.dst = ey_;
         p.ld_dst = D;
-        mq->run(p, s_);
+        if (legacy) mq->run(p, s_);
+        else mq->run_tiles(p, s_);
         mark(il, 7);
         k::moe_combine(ey_, inv_, eid_, ew_, L.down_exps_scale ? L.down_exps_scale.f32() : nullptr, moe_, D, n, K, s_);
         dump("moe_raw", il, moe_, D, n, s_);

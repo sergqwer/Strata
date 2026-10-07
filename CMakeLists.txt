@@ -80,3 +80,8 @@ target_link_libraries(strata-gemma-vision PRIVATE strata_gemma)
 add_executable(strata-gemma-server src/gemma/server_main.cpp)
 target_include_directories(strata-gemma-server PRIVATE ${STRATA_LLAMA_DIR}/vendor ${STRATA_LLAMA_DIR}/common)
 target_link_libraries(strata-gemma-server PRIVATE strata_gemma llama-common llama cpp-httplib)
+
+# tools/gemma/mmq: the MMQ products old vs new, bit for bit, on one layer's weights (not built by default)
+add_executable(strata-gemma-mmq-bench EXCLUDE_FROM_ALL tools/gemma/mmq/mmq_bench.cu)
+target_compile_options(strata-gemma-mmq-bench PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${STRATA_CUDA_FLAGS}>)
+target_link_libraries(strata-gemma-mmq-bench PRIVATE strata_gemma)
