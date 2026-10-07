@@ -36,7 +36,6 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
-#include <type_traits>
 
 namespace strata::kernels {
 namespace {
@@ -1201,8 +1200,6 @@ void wave_launch(const void* weights, const void* x_q8_1, float* y, int n_in, in
 #define STRATA_WAVE_MMVQ(...)
 #endif
 
-#include "native_mmvq_vt.cuh"
-
 template<typename Weight, int Qi>
 void small_mmvq(const void* weights, const void* x_q8_1, float* y,
                 int n_in, int n_out, int ncols, void* stream) {
@@ -1221,18 +1218,6 @@ void small_mmvq(const void* weights, const void* x_q8_1, float* y,
     const auto* w = static_cast<const Weight*>(weights);
     const auto* x = static_cast<const Q81Block*>(x_q8_1);
     const auto s = static_cast<cudaStream_t>(stream);
-    if (vt_on() && (Qi == 8 || std::is_same<Weight, Q40Block>::value) && vt_pays<SmallTraits<Weight, Qi>>(n_in)) {
-        // the same per-row arithmetic, a warp per row (Q4_0 and Q8_0: the formats this engine's models use)
-        VtJobs jobs;
-        jobs.n = 1;
-        jobs.w[0] = weights;
-        jobs.y[0] = y;
-        jobs.n_out[0] = n_out;
-        if (launch_vt<SmallTraits<Weight, Qi>>(jobs, x_q8_1, n_in, s)) {
-            launch_check();
-            return;
-        }
-    }
     const dim3 threads(WARP, WARPS);
     if (n_in / 32 < 2 * WARPS * WARP / Qi) {
         const unsigned blocks = unsigned((std::size_t(n_out) + WARPS - 1) / WARPS);
@@ -1828,17 +1813,6 @@ void native_mmvq_id(int ggml_type, const void* w_base, std::size_t expert_bytes,
     if (n_pairs <= 0) return;
     if (x_div < 1) throw std::invalid_argument("native_mmvq_id: x_div must be >= 1");
     const auto s = static_cast<cudaStream_t>(stream);
-    if (vt_on() && (ggml_type == 2 || ggml_type == 8)) {   // the same arithmetic, a warp per R rows
-        bool done = false;
-        switch (ggml_type) {
-        case 2: if (vt_pays<SmallTraits<Q40Block, 4>>(n_in)) done = launch_vt_id<SmallTraits<Q40Block, 4>>(w_base, expert_bytes, ids, n_pairs, x_q8_1, x_div, y, n_in, n_out, s); break;
-        default: if (vt_pays<SmallTraits<Q80Block, 8>>(n_in)) done = launch_vt_id<SmallTraits<Q80Block, 8>>(w_base, expert_bytes, ids, n_pairs, x_q8_1, x_div, y, n_in, n_out, s); break;
-        }
-        if (done) {
-            launch_check();
-            return;
-        }
-    }
     switch (ggml_type) {
     case 2: launch_id<SmallTraits<Q40Block, 4>>(w_base, expert_bytes, ids, n_pairs, x_q8_1, x_div, y, n_in, n_out, s); break;
     case 6: launch_id<SmallTraits<Q50Block, 4>>(w_base, expert_bytes, ids, n_pairs, x_q8_1, x_div, y, n_in, n_out, s); break;
@@ -1847,66 +1821,6 @@ void native_mmvq_id(int ggml_type, const void* w_base, std::size_t expert_bytes,
     case 13: launch_id<Q5KTraits>(w_base, expert_bytes, ids, n_pairs, x_q8_1, x_div, y, n_in, n_out, s); break;
     case 14: launch_id<Q6KTraits>(w_base, expert_bytes, ids, n_pairs, x_q8_1, x_div, y, n_in, n_out, s); break;
     default: throw std::invalid_argument("native_mmvq_id: unsupported GGML type " + std::to_string(ggml_type));
-    }
-    launch_check();
-}
-
-bool native_mmvq_vt() { return vt_on(); }
-void native_mmvq_set_vt_rows(int rows) { g_vt_rows = rows; }
-
-bool native_mmvq_multi_w_supported(int ggml_type) noexcept {
-    return ggml_type == 2 || ggml_type == 6 || ggml_type == 8 || ggml_type == 20;
-}
-
-void native_mmvq_multi_w(int ggml_type, int n_mats, const void* const* w, float* const* y, const int* n_out,
-                         const void* x_q8_1, int n_in, void* stream) {
-    if (n_mats < 1 || n_mats > 4) throw std::invalid_argument("native_mmvq_multi_w: 1..4 matrices");
-    if (!vt_on() || !native_mmvq_multi_w_supported(ggml_type)) {   // one launch each, as before
-        for (int j = 0; j < n_mats; ++j) native_mmvq(ggml_type, w[j], x_q8_1, y[j], n_in, n_out[j], 1, stream);
-        return;
-    }
-    validate_shape(n_in, 1, 32);
-    validate_pointer(x_q8_1);
-    validate_stream(stream);
-    VtJobs jobs;
-    jobs.n = n_mats;
-    for (int j = 0; j < n_mats; ++j) {
-        if (n_out[j] <= 0) throw std::invalid_argument("native_mmvq_multi_w: n_out must be positive");
-        validate_pointer(w[j]);
-        validate_pointer(y[j]);
-        jobs.w[j] = w[j];
-        jobs.y[j] = y[j];
-        jobs.n_out[j] = n_out[j];
-    }
-    const auto s = static_cast<cudaStream_t>(stream);
-    int rows = 0;
-    for (int j = 0; j < n_mats; ++j) rows += n_out[j];
-    const auto* x = static_cast<const Q81Block*>(x_q8_1);
-    const dim3 threads(WARP, WARPS);
-    bool done = true;
-    switch (ggml_type) {
-    case 2:
-        if (vt_pays<SmallTraits<Q40Block, 4>>(n_in)) done = launch_vt<SmallTraits<Q40Block, 4>>(jobs, x_q8_1, n_in, s);
-        else if (n_in / 32 >= SmallTraits<Q40Block, 4>::BPI) multi_w_small_kernel<Q40Block, 4><<<unsigned(rows), threads, 0, s>>>(jobs, x, n_in);
-        else done = false;
-        break;
-    case 6:
-        if (n_in / 32 >= SmallTraits<Q50Block, 4>::BPI) multi_w_small_kernel<Q50Block, 4><<<unsigned(rows), threads, 0, s>>>(jobs, x, n_in);
-        else done = false;
-        break;
-    case 8:
-        if (vt_pays<SmallTraits<Q80Block, 8>>(n_in)) done = launch_vt<SmallTraits<Q80Block, 8>>(jobs, x_q8_1, n_in, s);
-        else if (n_in / 32 >= SmallTraits<Q80Block, 8>::BPI) multi_w_small_kernel<Q80Block, 8><<<unsigned(rows), threads, 0, s>>>(jobs, x, n_in);
-        else done = false;
-        break;
-    default:
-        if (n_in / 32 >= SmallTraits<IQ4NLBlock, 4>::BPI) multi_w_small_kernel<IQ4NLBlock, 4><<<unsigned(rows), threads, 0, s>>>(jobs, x, n_in);
-        else done = false;
-        break;
-    }
-    if (!done) {
-        for (int j = 0; j < n_mats; ++j) native_mmvq(ggml_type, w[j], x_q8_1, y[j], n_in, n_out[j], 1, stream);
-        return;
     }
     launch_check();
 }

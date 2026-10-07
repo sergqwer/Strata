@@ -1,6 +1,7 @@
 // src/gemma/engine.cpp - see include/strata/gemma/engine.hpp.
 #include "strata/gemma/engine.hpp"
 
+#include "strata/gemma/decode.hpp"
 #include "strata/gemma/kernels.hpp"
 #include "strata/gemma/mmq.hpp"
 #include "strata/kernels/native_mmvq.hpp"
@@ -64,6 +65,11 @@ template <class T> T* Engine::carve(size_t count) {
 Engine::Engine(const Model& m, int ctx, int max_batch) : m_(m), ctx_(ctx), max_batch_(max_batch) {
     const Config& c = m.cfg;
     ck(cudaStreamCreateWithFlags(&s_, cudaStreamNonBlocking), "stream");
+    // the decode layer's FFN fork (decode.hpp): the dense MLP on side_ while the experts run on s_
+    ck(cudaStreamCreateWithFlags(&side_, cudaStreamNonBlocking), "stream");
+    ck(cudaEventCreateWithFlags(&ev_fork_, cudaEventDisableTiming), "event");
+    ck(cudaEventCreateWithFlags(&ev_join_, cudaEventDisableTiming), "event");
+    if (const char* e = std::getenv("STRATA_NO_FORK")) fork_ = std::string(e) != "1";
     cublasHandle_t h;
     cb(cublasCreate(&h), "create");
     cb(cublasSetStream(h, s_), "stream");
@@ -160,6 +166,9 @@ Engine::~Engine() {
     if (cublas_) cublasDestroy((cublasHandle_t) cublas_);
     delete (mmq::Context*) mmq_;
     if (arena_) cudaFree(arena_);
+    if (ev_fork_) cudaEventDestroy(ev_fork_);
+    if (ev_join_) cudaEventDestroy(ev_join_);
+    if (side_) cudaStreamDestroy(side_);
     if (s_) cudaStreamDestroy(s_);
 }
 
@@ -344,71 +353,46 @@ void Engine::run_small(int n, Logits mode) {
 // ---------------------------------------------------------------------------------------------- a few rows
 
 void Engine::layer_small(int il, int n) {
-    using namespace strata::kernels;
     const Config& c = m_.cfg;
     const Layer& L = m_.layers[il];
-    const int D = c.n_embd, qd = L.n_head * L.head_dim, kvd = L.n_head_kv * L.head_dim;
-    const int K = c.n_expert_used, FE = c.n_ff_exp;
-
-    // xq_ = q8_1(rms(x) * attn_norm), left by the previous layer's last kernel
-    native_mmvq(L.wq.type, L.wq.d, xq_, q_, D, qd, n, s_);
-    native_mmvq(L.wk.type, L.wk.d, xq_, k_, D, kvd, n, s_);
-    if (L.wv) native_mmvq(L.wv.type, L.wv.d, xq_, v_, D, kvd, n, s_);
-
-    k::QkvArgs a;
-    a.q = q_;
-    a.k = k_;
-    a.v = L.wv ? v_ : nullptr;
-    a.q_norm = L.q_norm.f32();
-    a.k_norm = L.k_norm.f32();
-    a.freq_factors = L.swa ? nullptr : (m_.rope_freqs ? m_.rope_freqs.f32() : nullptr);
-    a.pos = pos_;
-    a.kc = kc_[il];
-    a.vc = vc_[il];
-    a.rows = n;
-    a.n_head = L.n_head;
-    a.n_kv = L.n_head_kv;
-    a.hd = L.head_dim;
-    a.n_rot = L.n_rot;
-    a.base = L.rope_base;
-    a.eps = c.eps;
-    k::qkv_prep(a, s_);
-    mark(il, 1);
-    const int32_t* lo = L.swa ? lo_ : lo_ + max_batch_;
-    const int32_t* hi = L.swa ? hi_ : hi_ + max_batch_;
-    k::attn_partials(q_, kc_[il], vc_[il], lo, hi, att_scratch_, n, L.n_head, L.n_head_kv, L.head_dim, n_split_, s_);
-    k::attn_combine_quant(att_scratch_, att_, xq_, n, L.n_head, L.head_dim, n_split_, s_);
-    native_mmvq(L.wo.type, L.wo.d, xq_, y_, qd, D, n, s_);
-
-    const bool moe = L.moe();
-    k::post_attn_fused(x_, y_, L.post_attn_norm.f32(), x1_, L.ffn_norm.f32(), xqf_, moe ? L.pre_ffw_norm_2.f32() : nullptr,
-                       moe ? xqg_ : nullptr, moe ? L.router_scale.f32() : nullptr, r_, D, n, c.eps, s_);
-    native_mmvq(L.ffn_gate.type, L.ffn_gate.d, xqf_, gate_, D, c.n_ff, n, s_);
-    native_mmvq(L.ffn_up.type, L.ffn_up.d, xqf_, up_, D, c.n_ff, n, s_);
-    k::geglu_quant(gate_, up_, c.n_ff, xqh_, c.n_ff, n, s_);
-    native_mmvq(L.ffn_down.type, L.ffn_down.d, xqh_, mlp_, c.n_ff, D, n, s_);
-    if (moe) {
-        k::router_gemv(L.router.f32(), r_, rlog_, c.n_expert, D, n, s_);
-        k::router_topk(rlog_, c.n_expert, K, n, eid_, ew_, s_);
-        static const bool no_group = std::getenv("STRATA_NO_GROUP") != nullptr;
-        if (n == 1 || no_group) {   // one token: the 4-warps-per-row id kernel is faster
-            native_mmvq_id(L.gate_up_exps.type, L.gate_up_exps.d, L.gate_up_exps.nb2, eid_, n * K, xqg_, K, gu_, D, 2 * FE, s_);
-            k::geglu_quant(gu_, gu_ + FE, 2 * FE, xqe_, FE, n * K, s_);
-            native_mmvq_id(L.down_exps.type, L.down_exps.d, L.down_exps.nb2, eid_, n * K, xqe_, 1, ey_, FE, D, s_);
-        } else {   // a verify window: an expert several tokens chose is read once
-            native_mmvq_group_ids(eid_, n * K, groups_, s_);
-            native_mmvq_grouped(L.gate_up_exps.type, L.gate_up_exps.d, L.gate_up_exps.nb2, groups_, n * K, xqg_, K, gu_, D,
-                                2 * FE, s_);
-            k::geglu_quant(gu_, gu_ + FE, 2 * FE, xqe_, FE, n * K, s_);
-            native_mmvq_grouped(L.down_exps.type, L.down_exps.d, L.down_exps.nb2, groups_, n * K, xqe_, 1, ey_, FE, D, s_);
-        }
-    }
+    DecodeBufs b;
+    b.x = x_;
+    b.x1 = x1_;
+    b.y = y_;
+    b.mlp = mlp_;
+    b.q = q_;
+    b.att = att_;
+    b.k = k_;
+    b.v = v_;
+    b.gate = gate_;
+    b.up = up_;
+    b.r = r_;
+    b.rlog = rlog_;
+    b.ew = ew_;
+    b.gu = gu_;
+    b.ey = ey_;
+    b.eid = eid_;
+    b.xq = xq_;
+    b.xqf = xqf_;
+    b.xqg = xqg_;
+    b.xqh = xqh_;
+    b.xqe = xqe_;
+    b.att_scratch = att_scratch_;
+    b.groups = groups_;
+    b.pos = pos_;
+    b.lo = lo_;
+    b.hi = hi_;
+    b.max_batch = max_batch_;
+    b.n_split = n_split_;
+    DecodeFork f;
+    f.side = side_;
+    f.fork = ev_fork_;
+    f.join = ev_join_;
     const bool last = il + 1 == c.n_layer;
-    k::moe_post_fused(moe ? ey_ : nullptr, eid_, ew_, L.down_exps_scale ? L.down_exps_scale.f32() : nullptr, K, mlp_, x1_,
-                      moe ? L.post_ffw_norm_1.f32() : nullptr, moe ? L.post_ffw_norm_2.f32() : nullptr,
-                      L.post_ffw_norm.f32(), L.out_scale, x_,
-                      last ? m_.output_norm.f32() : m_.layers[il + 1].attn_norm.f32(), xq_, D, n, c.eps, s_,
-                      last ? hnorm_ : nullptr);
+    // xq_ = q8_1(rms(x) * attn_norm), left by the previous layer's last kernel
+    decode_layer(c, L, L.swa ? nullptr : (m_.rope_freqs ? m_.rope_freqs.f32() : nullptr), kc_[il], vc_[il],
+                 last ? m_.output_norm.f32() : m_.layers[il + 1].attn_norm.f32(), last ? hnorm_ : nullptr, b, n, s_,
+                 fork_ ? &f : nullptr);
 }
 
 // ---------------------------------------------------------------------------------------------- a prompt chunk
@@ -524,13 +508,13 @@ void Engine::layer_big(int il, int n) {
     dump("kqv_out", il, att_, qd, n, s_);
     mmq::quantize(att_, nullptr, xq_, L.wo.type, qd, qd, n, s_);
     dense(L.wo, xq_, n, y_);
-    k::add_rms(x_, y_, L.post_attn_norm.f32(), x1_, D, n, c.eps, s_);
+    const bool moe = L.moe();
+    // x1 = x + rms(y) * post_attn_norm, then the FFN's three norms of x1 (one pass; moe-glue)
+    k::add_rms_ffn_norms(x_, y_, L.post_attn_norm.f32(), x1_, L.ffn_norm.f32(), moe ? L.pre_ffw_norm_2.f32() : nullptr,
+                         moe ? L.router_scale.f32() : nullptr, f_, moe ? g_ : nullptr, moe ? r_ : nullptr, D, n, c.eps, s_);
     dump("attn_out", il, x1_, D, n, s_);
     mark(il, 3);
 
-    const bool moe = L.moe();
-    k::ffn_norms(x1_, L.ffn_norm.f32(), moe ? L.pre_ffw_norm_2.f32() : nullptr, moe ? L.router_scale.f32() : nullptr,
-                 f_, moe ? g_ : nullptr, moe ? r_ : nullptr, D, n, c.eps, s_);
     mmq::quantize(f_, nullptr, xq_, L.ffn_gate.type, D, D, n, s_);
     dense(L.ffn_gate, xq_, n, gate_);
     if (L.ffn_up.type != L.ffn_gate.type) mmq::quantize(f_, nullptr, xq_, L.ffn_up.type, D, D, n, s_);
@@ -545,9 +529,9 @@ void Engine::layer_big(int il, int n) {
     if (moe) {
         cb(cublasSgemm(hb, CUBLAS_OP_T, CUBLAS_OP_N, E, n, D, &one, L.router.f32(), D, r_, D, &zero, rlog_, E), "router");
         dump("ffn_moe_logits", il, rlog_, E, n, s_);
-        k::router_topk(rlog_, E, K, n, eid_, ew_, s_);
+        k::router_topk2(rlog_, E, K, n, eid_, ew_, s_);
         dump("ffn_moe_weights_norm", il, ew_, K, n, s_);
-        k::moe_sort(eid_, n, K, E, bounds_, src_, inv_, counts_, s_);
+        k::moe_sort2(eid_, n, K, E, bounds_, src_, inv_, counts_, s_);
         const int64_t rows = (int64_t) n * K;
         int max_rows = 0;
         if (legacy) {
@@ -596,12 +580,20 @@ void Engine::layer_big(int il, int n) {
         if (legacy) mq->run(p, s_);
         else mq->run_tiles(p, s_);
         mark(il, 7);
-        k::moe_combine(ey_, inv_, eid_, ew_, L.down_exps_scale ? L.down_exps_scale.f32() : nullptr, moe_, D, n, K, s_);
-        dump("moe_raw", il, moe_, D, n, s_);
+        if (!g_dumping) {   // combine + post in one pass (moe-glue)
+            k::moe_combine_post(ey_, inv_, eid_, ew_, L.down_exps_scale ? L.down_exps_scale.f32() : nullptr, moe_, x1_,
+                                mlp_, L.post_ffw_norm_1.f32(), L.post_ffw_norm_2.f32(), L.post_ffw_norm.f32(),
+                                L.out_scale, x_, D, n, K, c.eps, s_);
+        } else {
+            k::moe_combine(ey_, inv_, eid_, ew_, L.down_exps_scale ? L.down_exps_scale.f32() : nullptr, moe_, D, n, K, s_);
+            dump("moe_raw", il, moe_, D, n, s_);
+        }
     }
-    dump("mlp_raw", il, mlp_, D, n, s_);
-    k::ffn_post(x1_, mlp_, moe ? moe_ : nullptr, moe ? L.post_ffw_norm_1.f32() : nullptr,
-                moe ? L.post_ffw_norm_2.f32() : nullptr, L.post_ffw_norm.f32(), L.out_scale, x_, D, n, c.eps, s_);
+    if (!moe || g_dumping) {
+        dump("mlp_raw", il, mlp_, D, n, s_);
+        k::ffn_post(x1_, mlp_, moe ? moe_ : nullptr, moe ? L.post_ffw_norm_1.f32() : nullptr,
+                    moe ? L.post_ffw_norm_2.f32() : nullptr, L.post_ffw_norm.f32(), L.out_scale, x_, D, n, c.eps, s_);
+    }
     if (!moe) {  // a dense layer: its MoE phases take no time
         mark(il, 5);
         mark(il, 6);
