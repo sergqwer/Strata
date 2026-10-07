@@ -343,7 +343,7 @@ bool g_check_only = false;
 double g_vram_mb = 450;        // the whole process (the CUDA context and code take ~175 MiB of it)
 int g_frac = 0;                // MoE: 1 = all 96 experts, 2 = every 2nd by routing mass with top-4 (same rows per
                                // expert, half the weights and rows), 0 = 1 if it fits the budget, else 2, else 4
-std::vector<std::pair<int, int>> g_variants;   // run_tiles knobs (jset, c0) to time against the old code
+std::vector<std::vector<std::pair<std::string, int>>> g_variants;   // knob settings to time against the old code
 
 }  // namespace
 
@@ -386,10 +386,19 @@ int main(int argc, char** argv) {
         else if (a == "--check-only") g_check_only = true;
         else if (a == "--vram-mb") g_vram_mb = std::atof(next().c_str());
         else if (a == "--expert-frac") g_frac = std::atoi(next().c_str());
-        else if (a == "--variants") {   // e.g. 0:32,1:32,0:0
-            for (auto& v : split(next())) {
-                const size_t c = v.find(':');
-                g_variants.push_back({std::atoi(v.substr(0, c).c_str()), std::atoi(v.substr(c + 1).c_str())});
+        else if (a == "--variants") {   // e.g. "u8=0;u8=1;fast=0;c0=96,u8=1"
+            const std::string v = next();
+            size_t p0 = 0;
+            while (p0 <= v.size()) {
+                const size_t p1 = v.find(';', p0);
+                std::vector<std::pair<std::string, int>> var;
+                for (auto& kv : split(v.substr(p0, p1 == std::string::npos ? std::string::npos : p1 - p0))) {
+                    const size_t e = kv.find('=');
+                    if (e != std::string::npos) var.push_back({kv.substr(0, e), std::atoi(kv.substr(e + 1).c_str())});
+                }
+                g_variants.push_back(var);
+                if (p1 == std::string::npos) break;
+                p0 = p1 + 1;
             }
         }
         else {
@@ -535,15 +544,18 @@ int main(int argc, char** argv) {
                     auto tiles = [&] { mq.run_tiles(p, s); };
                     const char* nm = pass == 0 ? "gate_up" : "down";
                     const auto ref = run_capture(with_sync, out.p, out_bytes, s);
-                    std::vector<std::pair<int, int>> vars = g_variants;
-                    if (vars.empty()) vars.push_back({-1, -1});
-                    for (auto [js, c0] : vars) {
-                        if (js >= 0) mmq::tile_tuning(js, c0);
+                    auto vars = g_variants;
+                    if (vars.empty()) vars.push_back({});
+                    for (const auto& var : vars) {
+                        std::string desc;
+                        for (const auto& [kn, kv] : var) {
+                            mmq::knob(kn.c_str(), kv);
+                            desc += (desc.empty() ? "" : " ") + kn + "=" + std::to_string(kv);
+                        }
                         char lb[96];
-                        if (js >= 0) std::snprintf(lb, sizeof lb, "%s (tiles jset %d c0 %d)", nm, js, c0);
-                        else std::snprintf(lb, sizeof lb, "%s (tiles vs grid)", nm);
+                        std::snprintf(lb, sizeof lb, "%s (new%s%s)", nm, desc.empty() ? "" : ": ", desc.c_str());
                         compare(lb, ref, run_capture(tiles, out.p, out_bytes, s));
-                        if (!g_check_only) report(lb, ab(old_only, tiles, s), js < 0 ? std::string(nm) + " " + key : "");
+                        if (!g_check_only) report(lb, ab(old_only, tiles, s), var.empty() ? std::string(nm) + " " + key : "");
                     }
                     if (!g_check_only) report((std::string(nm) + " + bounds sync (old)").c_str(), ab(with_sync, tiles, s),
                                               std::string(nm) + "+sync " + key);
@@ -569,14 +581,14 @@ int main(int argc, char** argv) {
                 char label[96];
                 std::snprintf(label, sizeof label, "%s n=%d (%lldx%lld)", nm.c_str(), n, (long long) w.ne1, (long long) w.ne0);
                 const auto ref = run_capture([&] { mq.run(p, s); }, out.p, (size_t) n * w.ne1 * 4, s);
-                const auto alt = run_capture([&] { mq.run_tiles(p, s); }, out.p, (size_t) n * w.ne1 * 4, s);
+                const auto alt = run_capture([&] { mq.run_dense(p, s); }, out.p, (size_t) n * w.ne1 * 4, s);
                 const char* mode = dense_mode(w.ne1, n, nsm);
-                compare((std::string(label) + " tiles [old: " + mode + "]").c_str(), ref, alt, 4, std::strcmp(mode, "tiling") == 0);
+                compare((std::string(label) + " [" + mode + "]").c_str(), ref, alt);
                 if (!g_check_only) {
-                    const auto r = ab([&] { mq.run(p, s); }, [&] { mq.run_tiles(p, s); }, s);
-                    report(label, r, "dense_" + nm + " " + std::to_string(n));
-                    const double tops = 2.0 * n * w.ne0 * w.ne1 / (r.first.med * 1e-3) / 1e12;
-                    std::printf("      old %.1f TOPS\n", tops);
+                    const auto r = ab([&] { mq.run(p, s); }, [&] { mq.run_dense(p, s); }, s);
+                    report(label, r, "dense " + nm + " " + std::to_string(n));
+                    const double ops = 2.0 * n * w.ne0 * w.ne1 / 1e12;
+                    std::printf("      %.1f -> %.1f TOPS\n", ops / (r.first.med * 1e-3), ops / (r.second.med * 1e-3));
                 }
             }
         }

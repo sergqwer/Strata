@@ -7,11 +7,15 @@
 #include "mmq.cuh"
 #include "quantize.cuh"
 
+#include "mmq_fast.cuh"
+#include "mmq_magic.cuh"
+
 #include <algorithm>
 #include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 
 namespace strata::gemma::mmq {
 namespace {
@@ -105,8 +109,9 @@ __global__ void build_tiles_kernel(const int32_t* __restrict__ bounds, int n_exp
     }
 }
 
-// one tile through llama.cpp's own tile code (the non-stream-k path of mul_mat_q: kb0 from 0 to the end)
-template <ggml_type type, int J>
+// one tile through llama.cpp's own tile code (the non-stream-k path of mul_mat_q: kb0 from 0 to the end); MAGIC:
+// with the conversion-free epilogue of mmq_magic.cuh
+template <ggml_type type, int J, bool MAGIC>
 __device__ __forceinline__ void tile_one(int* smem, const char* __restrict__ x, const int* __restrict__ y,
                                          const int32_t* __restrict__ ids, float* __restrict__ dst, const TileItem t,
                                          const int it, const int nrows_x, const int stride_row_x, const int ncols_y,
@@ -117,13 +122,18 @@ __device__ __forceinline__ void tile_one(int* smem, const char* __restrict__ x, 
     const int tid = threadIdx.y * blockDim.x + threadIdx.x;
     for (int j = tid; j < J; j += nthreads) smem[j] = ids[t.col0 + min(j, t.ncols - 1)];
     __syncthreads();
-    mul_mat_q_process_tile<type, J, fallback, false>(
-        x, t.expert * stride_expert_x + it * I * stride_row_x, y + t.col0 * (int) (sizeof(block_q8_1_mmq) / sizeof(int)),
-        smem, dst + it * I, nullptr, nullptr, stride_row_x, ncols_y, stride_col_dst, nrows_x - it * I - 1, t.ncols - 1,
-        0, kb_stop);
+    if constexpr (MAGIC)
+        magic::process_tile<type, J, fallback, false>(
+            x, t.expert * stride_expert_x + it * I * stride_row_x, y + t.col0 * (int) (sizeof(block_q8_1_mmq) / sizeof(int)),
+            smem, dst + it * I, stride_row_x, ncols_y, stride_col_dst, nrows_x - it * I - 1, t.ncols - 1, kb_stop, 0);
+    else
+        mul_mat_q_process_tile<type, J, fallback, false>(
+            x, t.expert * stride_expert_x + it * I * stride_row_x, y + t.col0 * (int) (sizeof(block_q8_1_mmq) / sizeof(int)),
+            smem, dst + it * I, nullptr, nullptr, stride_row_x, ncols_y, stride_col_dst, nrows_x - it * I - 1, t.ncols - 1,
+            0, kb_stop);
 }
 
-template <ggml_type type, int S, int MINB>
+template <ggml_type type, int S, int MINB, bool MAGIC = false>
 __launch_bounds__(256, MINB) __global__
 void tiles_kernel(const char* __restrict__ x, const int* __restrict__ y, const int32_t* __restrict__ ids,
                   const TileItem* __restrict__ items, int32_t* __restrict__ ctl, float* __restrict__ dst,
@@ -140,7 +150,7 @@ void tiles_kernel(const char* __restrict__ x, const int* __restrict__ y, const i
         if (g >= total) break;
         const int ti = g / nty, it = g - ti * nty;
         const TileItem t = items[ti];
-#define STRATA_TILE(Jv) tile_one<type, Jv>(smem, x, y, ids, dst, t, it, nrows_x, stride_row_x, ncols_y, stride_col_dst, stride_expert_x, kb_stop)
+#define STRATA_TILE(Jv) tile_one<type, Jv, MAGIC>(smem, x, y, ids, dst, t, it, nrows_x, stride_row_x, ncols_y, stride_col_dst, stride_expert_x, kb_stop)
         if constexpr (S == 0) {
             switch (t.jc) {
                 case 0: STRATA_TILE(128); break;
@@ -171,11 +181,11 @@ struct TilesLaunch {
     int smem = 0, grid = 0;
 };
 
-template <ggml_type type, int S, int MINB>
+template <ggml_type type, int S, int MINB, bool MAGIC = false>
 TilesLaunch tiles_launch() {
     static TilesLaunch L = [] {
         TilesLaunch l;
-        l.fn = tiles_kernel<type, S, MINB>;
+        l.fn = tiles_kernel<type, S, MINB, MAGIC>;
         const int id = ggml_cuda_get_device();
         const int cc = ggml_cuda_info().devices[id].cc, nsm = ggml_cuda_info().devices[id].nsm;
         for (int i = 0; i < jset_n(S); ++i)
@@ -188,6 +198,158 @@ TilesLaunch tiles_launch() {
     }();
     return L;
 }
+
+// ------------------------------------------------------------------------------------------------ fast tile drivers
+
+// the MoE tile list worked off by a persistent grid, as tiles_kernel, through fast::tile
+template <ggml_type type, bool U8>
+__launch_bounds__(fast::kThreads, 1) __global__
+void fast_moe_kernel(const fast::Args a, const TileItem* __restrict__ items, int32_t* __restrict__ ctl, const int nty) {
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+    extern __shared__ __align__(16) unsigned char fsmem[];
+    __shared__ int s_g;
+    const int total = ctl[0] * nty;
+    for (;;) {
+        if (threadIdx.x == 0) s_g = atomicAdd(&ctl[1], 1);
+        __syncthreads();
+        const int gi = s_g;
+        if (gi >= total) break;
+        const int ti = gi / nty;
+        const TileItem it = items[ti];
+        const fast::Tile t{it.expert, gi - ti * nty, it.col0, it.ncols, 0};
+        switch (it.jc) {   // width set 0
+            case 0: fast::tile<type, 128, false, U8>(a, t, fsmem); break;
+            case 1: fast::tile<type, 96, false, U8>(a, t, fsmem); break;
+            case 2: fast::tile<type, 64, false, U8>(a, t, fsmem); break;
+            case 3: fast::tile<type, 48, false, U8>(a, t, fsmem); break;
+            case 4: fast::tile<type, 32, false, U8>(a, t, fsmem); break;
+            default: fast::tile<type, 16, false, U8>(a, t, fsmem); break;
+        }
+        __syncthreads();   // the next tile reuses the shared memory and s_g
+    }
+#else
+    NO_DEVICE_CODE;
+#endif
+}
+
+// a dense product on llama.cpp's own tile grid (J, ntx x nty tiles, tile L = it * ntx + jt); with stream-k (G > 0
+// blocks over tot = ntiles * bpn k blocks, each block's start rounded down to bpi blocks) a tile the split cuts
+// gets its cut point, so its two partial sums meet as llama.cpp's fixup adds them
+template <ggml_type type, int J, bool SEG>
+__launch_bounds__(fast::kThreads, 1) __global__
+void fast_dense_kernel(const fast::Args a, const int ncols, const int ntx, const int G, const long long tot, const int bpn,
+                       const int bpi) {
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+    extern __shared__ __align__(16) unsigned char fsmem[];
+    const int L = blockIdx.x, jt = L % ntx, it = L / ntx;
+    int seg = 0;
+    if constexpr (SEG) {
+        const long long lo = (long long) L * bpn, hi = lo + bpn;
+        const int b0 = (int) (lo * G / tot);
+        for (int b = max(b0, 1); b <= min(b0 + 2, G - 1); ++b) {
+            long long B = (long long) b * tot / G;
+            B -= (B % bpn) % bpi;
+            if (B > lo && B < hi) seg = (int) (B - lo);
+        }
+    }
+    const fast::Tile t{0, it, jt * J, min(J, ncols - jt * J), seg};
+    fast::tile<type, J, SEG>(a, t, fsmem);
+#else
+    NO_DEVICE_CODE;
+#endif
+}
+
+// a dense product on llama.cpp's own tile grid through mmq_magic.cuh's tile (llama.cpp's code, conversion-free
+// epilogue); stream-k (G > 0) mirrored as in fast_dense_kernel
+template <ggml_type type, int J, bool fallback, bool SEG>
+__launch_bounds__(256, 1) __global__
+void magic_dense_kernel(const char* __restrict__ x, const int* __restrict__ y, const int32_t* __restrict__ ids,
+                        float* __restrict__ dst, const int nrows_x,
+                        const int stride_row_x, const int ncols, const int stride_col_dst, const int bpn, const int ntx,
+                        const int G, const long long tot, const int bpi) {
+#if __CUDA_ARCH__ >= GGML_CUDA_CC_AMPERE
+    extern __shared__ int msmem[];
+    constexpr int I = 128;
+    const int L = blockIdx.x, jt = L % ntx, it = L / ntx;
+    int seg = 0;
+    if constexpr (SEG) {
+        const long long lo = (long long) L * bpn, hi = lo + bpn;
+        const int b0 = (int) (lo * G / tot);
+        for (int b = max(b0, 1); b <= min(b0 + 2, G - 1); ++b) {
+            long long B = (long long) b * tot / G;
+            B -= (B % bpn) % bpi;
+            if (B > lo && B < hi) seg = (int) (B - lo);
+        }
+    }
+    const int tid = threadIdx.y * blockDim.x + threadIdx.x;
+    for (int j = tid; j < J; j += 256) msmem[j] = ids[jt * J + min(j, ncols - 1 - jt * J)];
+    __syncthreads();
+    magic::process_tile<type, J, fallback, SEG>(x, it * I * stride_row_x, y + jt * J * (int) (sizeof(block_q8_1_mmq) / sizeof(int)),
+                                                msmem, dst + it * I, stride_row_x, ncols, stride_col_dst, nrows_x - it * I - 1,
+                                                ncols - jt * J - 1, bpn, seg);
+#else
+    NO_DEVICE_CODE;
+#endif
+}
+
+using magic_dense_fn = void (*)(const char*, const int*, const int32_t*, float*, int, int, int, int, int, int, int, long long, int);
+
+template <ggml_type type, int J, bool fallback, bool SEG> magic_dense_fn magic_dense_get(int cc) {
+    static magic_dense_fn f = [cc] {
+        magic_dense_fn k = magic_dense_kernel<type, J, fallback, SEG>;
+        const int smem = (int) mmq_get_nbytes_shared(ggml_cuda_mmq_get_config(type, J, fallback, cc), cc);
+        ck(cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, smem), "magic dense smem");
+        return k;
+    }();
+    return f;
+}
+
+template <ggml_type type, bool fallback> magic_dense_fn magic_dense_pick(int J, bool seg, int cc) {
+#define STRATA_MD(Jv) case Jv: return seg ? magic_dense_get<type, Jv, fallback, true>(cc) : magic_dense_get<type, Jv, fallback, false>(cc)
+    if constexpr (fallback) {
+        switch (J) {
+            STRATA_MD(64);
+            STRATA_MD(128);
+            default: return nullptr;
+        }
+    } else {
+        switch (J) {
+            STRATA_MD(64);
+            STRATA_MD(80);
+            STRATA_MD(96);
+            STRATA_MD(112);
+            STRATA_MD(128);
+            default: return nullptr;
+        }
+    }
+#undef STRATA_MD
+}
+
+using fast_dense_fn = void (*)(const fast::Args, int, int, int, long long, int, int);
+
+template <ggml_type type, int J, bool SEG> fast_dense_fn fast_dense_get() {
+    static fast_dense_fn f = [] {
+        fast_dense_fn k = fast_dense_kernel<type, J, SEG>;
+        ck(cudaFuncSetAttribute(k, cudaFuncAttributeMaxDynamicSharedMemorySize, fast::smem_bytes<type>(J)), "fast dense smem");
+        return k;
+    }();
+    return f;
+}
+
+template <ggml_type type> fast_dense_fn fast_dense_pick(int J, bool seg) {
+    switch (J) {
+        case 64: return seg ? fast_dense_get<type, 64, true>() : fast_dense_get<type, 64, false>();
+        case 80: return seg ? fast_dense_get<type, 80, true>() : fast_dense_get<type, 80, false>();
+        case 96: return seg ? fast_dense_get<type, 96, true>() : fast_dense_get<type, 96, false>();
+        case 112: return seg ? fast_dense_get<type, 112, true>() : fast_dense_get<type, 112, false>();
+        case 128: return seg ? fast_dense_get<type, 128, true>() : fast_dense_get<type, 128, false>();
+        default: return nullptr;
+    }
+}
+
+int g_fast = -1;   // STRATA_MMQ_FAST: 2 (default) llama.cpp's tile with the conversion-free epilogue (mmq_magic.cuh),
+                   // 1 = mmq_fast.cuh's tile, 0 = llama.cpp's tile code unchanged
+int g_u8 = -1;     // STRATA_MMQ_U8 (default 0): Q4_0 fast tiles with unsigned nibbles
 
 int env_int(const char* name, int dflt) {
     const char* e = std::getenv(name);
@@ -393,6 +555,21 @@ void tile_tuning(int jset, int c0) {
     g_c0 = std::max(c0, 0);
 }
 
+void knob(const char* name, int value) {
+    const std::string n = name;
+    if (g_jset < 0) {
+        g_jset = env_int("STRATA_MMQ_JSET", 0) == 1 ? 1 : 0;
+        g_c0 = std::max(env_int("STRATA_MMQ_C0", 64), 0);
+    }
+    if (g_fast < 0) g_fast = env_int("STRATA_MMQ_FAST", 2);
+    if (g_u8 < 0) g_u8 = env_int("STRATA_MMQ_U8", 0) != 0;
+    if (n == "jset") g_jset = value == 1 ? 1 : 0;
+    else if (n == "c0") g_c0 = std::max(value, 0);
+    else if (n == "fast") g_fast = value;
+    else if (n == "u8") g_u8 = value != 0;
+    else std::fprintf(stderr, "mmq: unknown knob %s\n", name);
+}
+
 void Context::run_tiles(const Product& p, void* stream) {
     if (p.n <= 0 || p.total_rows <= 0) return;
     const ggml_type t = (ggml_type) p.type;
@@ -421,11 +598,52 @@ void Context::run_tiles(const Product& p, void* stream) {
         run(q, stream);
         return;
     }
+    if (g_fast < 0) g_fast = env_int("STRATA_MMQ_FAST", 2);
+    const bool use_fast = g_fast == 1 && g_jset == 0 && (p.w_cols / qk) * ggml_type_size(t) % 4 == 0 &&
+                          ((uintptr_t) p.w | (uintptr_t) p.xq) % 16 == 0 && p.expert_bytes % 4 == 0;
     build_tiles_kernel<<<1, 128, 0, s>>>(p.bounds, p.n, g_jset, g_c0, (TileItem*) items_, kTileCap, ctl_);
     ck(cudaGetLastError(), "build_tiles");
+    if (use_fast) {
+        if (g_u8 < 0) g_u8 = env_int("STRATA_MMQ_U8", 0) != 0;
+        const int u8 = g_u8;
+        auto kern = t == GGML_TYPE_Q4_0 ? (u8 ? fast_moe_kernel<GGML_TYPE_Q4_0, true> : fast_moe_kernel<GGML_TYPE_Q4_0, false>)
+                                        : fast_moe_kernel<GGML_TYPE_Q8_0, false>;
+        const int smem = t == GGML_TYPE_Q4_0 ? (u8 ? fast::smem_bytes<GGML_TYPE_Q4_0, true>(128) : fast::smem_bytes<GGML_TYPE_Q4_0>(128))
+                                             : fast::smem_bytes<GGML_TYPE_Q8_0>(128);
+        static int grid = 0;
+        static bool attr[3] = {false, false, false};
+        const int ai = t == GGML_TYPE_Q4_0 ? (u8 ? 1 : 0) : 2;
+        if (!attr[ai]) {
+            ck(cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, smem), "fast smem");
+            attr[ai] = true;
+        }
+        if (!grid) {
+            int per_sm = 0;
+            ck(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, kern, fast::kThreads, smem), "fast occupancy");
+            grid = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm * std::max(per_sm, 1);
+        }
+        fast::Args fa;
+        fa.x = (const char*) p.w;
+        fa.y = (const char*) p.xq;
+        fa.ids = p.ids;
+        fa.dst = p.dst;
+        fa.nrows = (int) p.w_rows;
+        fa.stride_row = (int) (p.w_cols / qk);
+        fa.stride_expert = (long long) (p.expert_bytes / ggml_type_size(t));
+        fa.ncols_y = (int) p.total_rows;
+        fa.ld_dst = (int) p.ld_dst;
+        fa.nkt = (int) ((p.w_cols / qk + 7) / 8 * 2);
+        const int nty = (int) (p.w_rows / 128);
+        kern<<<grid, fast::kThreads, smem, s>>>(fa, (const TileItem*) items_, ctl_, nty);
+        ck(cudaGetLastError(), "fast moe");
+        return;
+    }
     TilesLaunch L;
-    if (t == GGML_TYPE_Q4_0) L = g_jset == 0 ? tiles_launch<GGML_TYPE_Q4_0, 0, 1>() : tiles_launch<GGML_TYPE_Q4_0, 1, 2>();
-    else L = g_jset == 0 ? tiles_launch<GGML_TYPE_Q8_0, 0, 1>() : tiles_launch<GGML_TYPE_Q8_0, 1, 2>();
+    const bool mg = g_fast == 2;
+    if (t == GGML_TYPE_Q4_0)
+        L = g_jset == 0 ? (mg ? tiles_launch<GGML_TYPE_Q4_0, 0, 1, true>() : tiles_launch<GGML_TYPE_Q4_0, 0, 1>()) : tiles_launch<GGML_TYPE_Q4_0, 1, 2>();
+    else
+        L = g_jset == 0 ? (mg ? tiles_launch<GGML_TYPE_Q8_0, 0, 1, true>() : tiles_launch<GGML_TYPE_Q8_0, 0, 1>()) : tiles_launch<GGML_TYPE_Q8_0, 1, 2>();
     const char* x = (const char*) p.w;
     const int* y = (const int*) p.xq;
     const int32_t* ids = p.ids;
@@ -438,6 +656,89 @@ void Context::run_tiles(const Product& p, void* stream) {
     void* args[] = {&x, &y, &ids, &items, &ctl, &dst, &nrows_x, &stride_row_x, &ncols_y, &stride_col_dst,
                     &stride_expert_x, &kb_stop, &nty};
     ck(cudaLaunchKernel((const void*) L.fn, dim3(L.grid), dim3(32, 8, 1), args, (size_t) L.smem, s), "mmq tiles");
+}
+
+void Context::run_dense(const Product& p, void* stream) {
+    if (p.n != 1 || p.total_rows <= 0) {
+        run(p, stream);
+        return;
+    }
+    const ggml_type t = (ggml_type) p.type;
+    if (g_fast < 0) g_fast = env_int("STRATA_MMQ_FAST", 2);
+    const int64_t qk = ggml_blck_size(t);
+    const int id = ggml_cuda_get_device();
+    const int cc = ggml_cuda_info().devices[id].cc, nsm = ggml_cuda_info().devices[id].nsm;
+    const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
+    bool ok = g_fast && t == GGML_TYPE_Q8_0 && p.w_cols % qk == 0 && (p.w_cols / qk) * ggml_type_size(t) % 4 == 0 &&
+              ((uintptr_t) p.w | (uintptr_t) p.xq) % 16 == 0 && GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_AMPERE &&
+              p.total_rows * (p.w_cols / 128 + 1) * 144 < INT_MAX && p.ld_dst * (p.total_rows + 1) < INT_MAX;
+    // llama.cpp's launch for this product (mul_mat_q_case -> mul_mat_q_switch_J -> launch_mul_mat_q)
+    const bool fallback = p.w_rows % 128 != 0;
+    int J = 0, best = INT_MAX;
+    for (int j = 8; j <= 128 && best > 1; j += 8) {
+        const ggml_cuda_mmq_config c = ggml_cuda_mmq_get_config(t, j, fallback, cc);
+        if (c.type == GGML_TYPE_COUNT || mmq_get_nbytes_shared(c, cc) > smpbo) continue;
+        if (c.I != 128 || c.nthreads != 256 || c.K_vram != MMQ_ITER_K || !c.stream_k) ok = false;
+        const int nt = (int) ((p.max_rows + j - 1) / j);
+        if (nt < best) {
+            J = j;
+            best = nt;
+        }
+    }
+    const int ntx = (int) ((p.total_rows + J - 1) / std::max(J, 1)), nty = (int) ((p.w_rows + 127) / 128);
+    const int ntiles = ntx * nty, waves = (ntiles + nsm - 1) / nsm;
+    const bool streamk = 100 * ntiles / (nsm * waves) < 90;
+    const int bpn = (int) (p.w_cols / qk), bpi = MMQ_ITER_K / (int) qk;
+    const long long tot = (long long) ntiles * bpn;
+    if (ok && streamk) {   // the fast tile mirrors a split into at most two segments per tile
+        long long prev = -1;
+        for (int b = 1; b < nsm && ok; ++b) {
+            long long B = (long long) b * tot / nsm;
+            B -= (B % bpn) % bpi;
+            if (B % bpn != 0 && prev >= 0 && prev / bpn == B / bpn) ok = false;
+            if (B % bpn != 0) prev = B;
+        }
+    }
+    if (ok && g_fast == 2 && p.max_rows == p.total_rows && p.ids) {
+        const magic_dense_fn mfn = fallback ? magic_dense_pick<GGML_TYPE_Q8_0, true>(J, streamk, cc)
+                                            : magic_dense_pick<GGML_TYPE_Q8_0, false>(J, streamk, cc);
+        if (mfn) {
+            const char* x = (const char*) p.w;
+            const int* y = (const int*) p.xq;
+            const int32_t* ids = p.ids;
+            float* dst = p.dst;
+            int nrows_x = (int) p.w_rows, stride_row_x = bpn, ncols = (int) p.total_rows, stride_col_dst = (int) p.ld_dst,
+                bpn_ = bpn, ntx_ = ntx, G = streamk ? nsm : 0, bpi_ = bpi;
+            long long tot_ = tot;
+            void* args[] = {&x, &y, &ids, &dst, &nrows_x, &stride_row_x, &ncols, &stride_col_dst, &bpn_, &ntx_, &G, &tot_, &bpi_};
+            const int smem = (int) mmq_get_nbytes_shared(ggml_cuda_mmq_get_config(t, J, fallback, cc), cc);
+            ck(cudaLaunchKernel((const void*) mfn, dim3(ntiles), dim3(32, 8, 1), args, (size_t) smem, (cudaStream_t) stream),
+               "magic dense");
+            return;
+        }
+    }
+    const fast_dense_fn fn = ok && g_fast == 1 ? fast_dense_pick<GGML_TYPE_Q8_0>(J, streamk) : nullptr;
+    if (!fn || p.max_rows != p.total_rows) {
+        run(p, stream);
+        return;
+    }
+    fast::Args fa;
+    fa.x = (const char*) p.w;
+    fa.y = (const char*) p.xq;
+    fa.ids = p.ids;
+    fa.dst = p.dst;
+    fa.nrows = (int) p.w_rows;
+    fa.stride_row = bpn;
+    fa.stride_expert = 0;
+    fa.ncols_y = (int) p.total_rows;
+    fa.ld_dst = (int) p.ld_dst;
+    fa.nkt = (bpn + 7) / 8 * 2;
+    int ncols = (int) p.total_rows, G = streamk ? nsm : 0;
+    long long tot_ = tot;
+    int bpn_ = bpn, bpi_ = bpi, ntx_ = ntx;
+    void* args[] = {&fa, &ncols, &ntx_, &G, &tot_, &bpn_, &bpi_};
+    ck(cudaLaunchKernel((const void*) fn, dim3(ntiles), dim3(fast::kThreads), args, (size_t) fast::smem_bytes<GGML_TYPE_Q8_0>(J),
+                        (cudaStream_t) stream), "fast dense");
 }
 
 void iota(int32_t* dst, int64_t n, void* stream) {

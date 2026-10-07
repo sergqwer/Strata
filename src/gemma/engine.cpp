@@ -442,6 +442,7 @@ void Engine::layer_big(int il, int n) {
     const int D = c.n_embd, hd = L.head_dim, qd = L.n_head * hd, kvd = L.n_head_kv * hd;
     const int K = c.n_expert_used, FE = c.n_ff_exp, E = c.n_expert;
     auto* mq = (mmq::Context*) mmq_;
+    static const bool legacy = mmq::legacy();   // STRATA_MMQ_LEGACY=1: the MMQ path as before, byte for byte
     const int32_t* dense_bounds = reinterpret_cast<const int32_t*>(ptrs_);
     auto dense = [&](const Tensor& w, const void* xq, int64_t rows, float* dst) {
         mmq::Product p;
@@ -458,7 +459,8 @@ void Engine::layer_big(int il, int n) {
         p.max_rows = rows;
         p.dst = dst;
         p.ld_dst = w.ne[1];
-        mq->run(p, s_);
+        if (legacy) mq->run(p, s_);
+        else mq->run_dense(p, s_);   // llama.cpp's tile grid through the faster tile code, bit-identical
     };
 
     mark(il, 0);
@@ -534,7 +536,6 @@ void Engine::layer_big(int il, int n) {
     dense(L.ffn_gate, xq_, n, gate_);
     if (L.ffn_up.type != L.ffn_gate.type) mmq::quantize(f_, nullptr, xq_, L.ffn_up.type, D, D, n, s_);
     dense(L.ffn_up, xq_, n, up_);
-    static const bool legacy = mmq::legacy();   // STRATA_MMQ_LEGACY=1: the path before the tile list, byte for byte
     if (legacy || !mmq::geglu_quantize(gate_, up_, c.n_ff, xq_, L.ffn_down.type, c.n_ff, n, s_)) {
         k::geglu(gate_, up_, hid_, n, c.n_ff, c.n_ff, s_);
         mmq::quantize(hid_, nullptr, xq_, L.ffn_down.type, c.n_ff, c.n_ff, n, s_);
