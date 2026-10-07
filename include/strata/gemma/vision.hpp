@@ -27,7 +27,9 @@ class Vision {
 public:
     /// Load an mmproj GGUF onto the current device. tokens: the image token budget (llama-server's
     /// --image-min-tokens = --image-max-tokens); max_patches bounds the work buffers.
-    Vision(const std::string& mmproj, int tokens = 280, int max_patches = 4096);
+    /// int8: the encoder layers' q/k/v, gate/up and down matrices as per-row int8 (quantized at load) and their
+    /// GEMMs as int8 x int8 -> int32 with per-patch activation scales (W8A8); attn_out and the projection stay bf16.
+    Vision(const std::string& mmproj, int tokens = 280, int max_patches = 4096, bool int8 = false);
     ~Vision();
     Vision(const Vision&) = delete;
     Vision& operator=(const Vision&) = delete;

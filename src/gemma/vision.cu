@@ -45,6 +45,20 @@ __device__ __forceinline__ float block_sum(float v) {
     return warp_sum(v);
 }
 
+__device__ __forceinline__ float block_max(float v) {
+    __shared__ float shm[32];
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+    const int w = threadIdx.x / 32, l = threadIdx.x % 32;
+    __syncthreads();
+    if (l == 0) shm[w] = v;
+    __syncthreads();
+    v = l < (int) (blockDim.x / 32) ? shm[l] : 0.f;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v = fmaxf(v, __shfl_xor_sync(0xffffffffu, v, o));
+    return v;
+}
+
 // ---------------------------------------------------------------------------------------------------- kernels
 
 // patches [n][3 * P * P] f16, column (c, ky, kx) = the conv kernel's ggml layout; value = px / 255 * 2 - 1
@@ -89,22 +103,48 @@ __global__ void rms_bf16_kernel(const float* __restrict__ x, const float* __rest
     }
 }
 
-// x += rms(y) * w
-__global__ void add_rms_kernel(float* __restrict__ x, const float* __restrict__ y, const float* __restrict__ w, int D,
-                               float eps) {
+// W8A8: rms(x) * w rounded to bf16 (what the bf16 path feeds its GEMM), then int8 with the row's scale (absmax / 127)
+__global__ void rms_i8_kernel(const float* __restrict__ x, const float* __restrict__ w, int8_t* __restrict__ q,
+                              float* __restrict__ s, int D, float eps) {
+    extern __shared__ float t[];
     const size_t r = blockIdx.x;
     float ss = 0.f;
-    for (int i = threadIdx.x; i < D; i += blockDim.x) ss += y[r * D + i] * y[r * D + i];
+    for (int i = threadIdx.x; i < D; i += blockDim.x) ss += x[r * D + i] * x[r * D + i];
     ss = block_sum(ss);
     const float sc = rsqrtf(ss / D + eps);
-    for (int i = threadIdx.x; i < D; i += blockDim.x) x[r * D + i] = y[r * D + i] * sc * w[i] + x[r * D + i];
+    float mx = 0.f;
+    for (int i = threadIdx.x; i < D; i += blockDim.x) {
+        float v = x[r * D + i] * sc;
+        if (w) v *= w[i];
+        v = __bfloat162float(__float2bfloat16(v));
+        t[i] = v;
+        mx = fmaxf(mx, fabsf(v));
+    }
+    mx = block_max(mx);
+    const float scale = fmaxf(mx, 1e-12f) / 127.f, inv = 1.f / scale;
+    for (int i = threadIdx.x; i < D; i += blockDim.x) q[r * D + i] = (int8_t) __float2int_rn(t[i] * inv);
+    if (threadIdx.x == 0) s[r] = scale;
+}
+
+// x += rms(y) * w; y either f32 or (W8A8) the int32 GEMM output times the row and column scales
+__global__ void add_rms_kernel(float* __restrict__ x, const float* __restrict__ y, const float* __restrict__ w, int D,
+                               float eps, const int32_t* __restrict__ yi, const float* __restrict__ sx,
+                               const float* __restrict__ sw) {
+    const size_t r = blockIdx.x;
+    auto yv = [&](int i) { return yi ? (float) yi[r * D + i] * sx[r] * sw[i] : y[r * D + i]; };
+    float ss = 0.f;
+    for (int i = threadIdx.x; i < D; i += blockDim.x) { const float v = yv(i); ss += v * v; }
+    ss = block_sum(ss);
+    const float sc = rsqrtf(ss / D + eps);
+    for (int i = threadIdx.x; i < D; i += blockDim.x) x[r * D + i] = yv(i) * sc * w[i] + x[r * D + i];
 }
 
 // per patch (one block), a warp per (q|k|v, head) slot: rms * norm -> 2-D rope for q / k, rms for v; written f16
 // [head][n][HDP], zero-padded. hd <= 96: a lane holds elements lane, lane + 32, lane + 64.
 __global__ void vit_qkv_kernel(const float* __restrict__ qkv, const float* __restrict__ qn, const float* __restrict__ kn,
                                __half* __restrict__ Q, __half* __restrict__ K, __half* __restrict__ V, int n, int H,
-                               int hd, int HDP, int ncols, float eps, float theta_scale) {
+                               int hd, int HDP, int ncols, float eps, float theta_scale,
+                               const int32_t* __restrict__ qi, const float* __restrict__ sx, const float* __restrict__ sw) {
     __shared__ float buf[8][96];
     const int g = blockIdx.x, p = g % n, warp = threadIdx.x / 32, lane = threadIdx.x % 32;   // row g: patch p, image g / n
     const size_t img_off = (size_t) (g / n) * H * n * HDP;
@@ -113,13 +153,16 @@ __global__ void vit_qkv_kernel(const float* __restrict__ qkv, const float* __res
     const float ts = fabsf(theta_scale);
     for (int slot = warp; slot < 3 * H; slot += 8) {
         const int which = slot / H, h = slot % H;
-        const float* src = qkv + (size_t) g * 3 * H * hd + (size_t) which * H * hd + (size_t) h * hd;
+        const size_t col0 = (size_t) which * H * hd + (size_t) h * hd;   // W8A8: int32 * row scale * column scale
+        const float* src = qkv + (size_t) g * 3 * H * hd + col0;
+        const int32_t* srci = qi ? qi + (size_t) g * 3 * H * hd + col0 : nullptr;
+        const float rs = qi ? sx[g] : 0.f;
         float v[3];
         float ss = 0.f;
 #pragma unroll
         for (int c = 0; c < 3; ++c) {
             const int i = lane + 32 * c;
-            v[c] = i < hd ? src[i] : 0.f;
+            v[c] = i < hd ? (srci ? (float) srci[i] * rs * sw[col0 + i] : src[i]) : 0.f;
             ss += v[c] * v[c];
         }
 #pragma unroll
@@ -154,6 +197,25 @@ __global__ void vit_qkv_kernel(const float* __restrict__ qkv, const float* __res
         }
         __syncwarp();
     }
+}
+
+// W8A8: one row: gate / up from the int32 GEMM output, gelu-quick(g) * u rounded to bf16, then int8 with its scale
+__global__ void geglu_i8_kernel(const int32_t* __restrict__ gu, const float* __restrict__ sx,
+                                const float* __restrict__ sw, int8_t* __restrict__ q, float* __restrict__ s, int F) {
+    extern __shared__ float t[];
+    const size_t r = blockIdx.x;
+    const float rs = sx[r];
+    float mx = 0.f;
+    for (int c = threadIdx.x; c < F; c += blockDim.x) {
+        const float g = (float) gu[r * 2 * F + c] * rs * sw[c], u = (float) gu[r * 2 * F + F + c] * rs * sw[F + c];
+        const float h = __bfloat162float(__float2bfloat16(g * (1.0f / (1.0f + expf(-1.702f * g))) * u));
+        t[c] = h;
+        mx = fmaxf(mx, fabsf(h));
+    }
+    mx = block_max(mx);
+    const float scale = fmaxf(mx, 1e-12f) / 127.f, inv = 1.f / scale;
+    for (int c = threadIdx.x; c < F; c += blockDim.x) q[r * F + c] = (int8_t) __float2int_rn(t[c] * inv);
+    if (threadIdx.x == 0) s[r] = scale;
 }
 
 __global__ void geglu_quick_kernel(const float* __restrict__ gu, bf16* __restrict__ h, int64_t n, int F) {
@@ -482,7 +544,11 @@ struct Vision::Impl {
     struct Layer {
         const float *ln1, *ln2, *post_attn, *post_ffn, *qn, *kn;
         const bf16 *wqkv, *wo, *wgu, *wdown;
+        // int8: per-row int8 matrices and their row scales ([3D], [2F], [D])
+        const int8_t *q8qkv = nullptr, *q8gu = nullptr, *q8down = nullptr;
+        const float *sqkv = nullptr, *sgu = nullptr, *sdown = nullptr;
     };
+    bool i8 = false;
     std::vector<Layer> layers;
     const __half* patch_w = nullptr;   // [D][3 P P]
     const float* pos = nullptr;        // [2][pos_size][D]
@@ -496,6 +562,8 @@ struct Vision::Impl {
     __half* patches = nullptr;
     float *x = nullptr, *y = nullptr, *qkv = nullptr, *gu = nullptr, *outv = nullptr;
     bf16 *hb = nullptr, *ab = nullptr, *fb = nullptr;
+    int8_t* hq = nullptr;                    // int8: a GEMM input [N][<= F]
+    float *sx1 = nullptr, *sx2 = nullptr;    // int8: its row scales (gate / up input, down input)
     __half *Qh = nullptr, *Kh = nullptr, *Vh = nullptr;
     void* work = nullptr;
     cublasHandle_t blas = nullptr;
@@ -507,8 +575,9 @@ struct Vision::Impl {
     void mark(int il, int k, cudaStream_t s);
 };
 
-Vision::Vision(const std::string& path, int tokens, int max_patches) : p_(new Impl), tokens_(tokens) {
+Vision::Vision(const std::string& path, int tokens, int max_patches, bool int8) : p_(new Impl), tokens_(tokens) {
     Impl& m = *p_;
+    m.i8 = int8;
     GgufFile g(path);
     auto u = [&](const char* k) -> uint64_t {
         const MetaValue* v = g.get(k);
@@ -530,7 +599,8 @@ Vision::Vision(const std::string& path, int tokens, int max_patches) : p_(new Im
     n_out_ = m.n_out;
 
     // ---- weights: matrices as bf16 (they are BF16 in the file), the conv kernel as f16, the rest f32
-    struct Item { const TensorInfo* ti; size_t off; int kind; };   // kind 0 copy, 1 f32 -> f16
+    struct Item { const TensorInfo* ti; size_t off; int kind; size_t soff = 0; };   // kind 0 copy, 1 f32 -> f16,
+                                                                                    // 2 bf16 -> int8 rows (+ scales)
     std::vector<Item> items;
     size_t total = 0;
     auto add = [&](const std::string& name, int kind, bool required = true) -> size_t {
@@ -542,13 +612,16 @@ Vision::Vision(const std::string& path, int tokens, int max_patches) : p_(new Im
         total = (total + 255) / 256 * 256;
         const size_t off = total;
         const size_t elems = ti->elements();
-        const size_t bytes = kind == 1 ? elems * 2 : ti->type == 0 ? elems * 4 : elems * 2;
+        const size_t bytes = kind == 2 ? elems : kind == 1 ? elems * 2 : ti->type == 0 ? elems * 4 : elems * 2;
+        if (kind == 2 && ti->type != 30) throw std::runtime_error("mmproj: " + name + " is not BF16 (int8 needs BF16)");
         if (kind == 0 && ti->type != 0 && ti->type != 30) throw std::runtime_error("mmproj: " + name + " is " + ti->type_name());
         total += bytes;
         items.push_back({ti, off, kind});
         return off;
     };
-    struct LOff { size_t ln1, ln2, pa, pf, qn, kn, q, k, v, o, g, up, d; };
+    struct LOff { size_t ln1, ln2, pa, pf, qn, kn, q, k, v, o, g, up, d, sqkv = 0, sgu = 0, sd = 0; };
+    auto reserve = [&](size_t bytes) { total = (total + 255) / 256 * 256; const size_t o = total; total += bytes; return o; };
+    const int k8 = m.i8 ? 2 : 0;
     std::vector<LOff> lo(m.n_layer);
     const size_t o_patch = add("v.patch_embd.weight", 1);
     const size_t o_pos = add("v.position_embd.weight", 0);
@@ -564,15 +637,28 @@ Vision::Vision(const std::string& path, int tokens, int max_patches) : p_(new Im
         L.qn = add(p + "attn_q_norm.weight", 0);
         L.kn = add(p + "attn_k_norm.weight", 0);
         // q, k, v back to back = one [3D][D] matrix; gate, up = one [2F][D]
-        L.q = add(p + "attn_q.weight", 0);
-        L.k = add(p + "attn_k.weight", 0);
-        L.v = add(p + "attn_v.weight", 0);
+        const size_t iq = items.size();
+        L.q = add(p + "attn_q.weight", k8);
+        L.k = add(p + "attn_k.weight", k8);
+        L.v = add(p + "attn_v.weight", k8);
         L.o = add(p + "attn_out.weight", 0);
-        L.g = add(p + "ffn_gate.weight", 0);
-        L.up = add(p + "ffn_up.weight", 0);
-        L.d = add(p + "ffn_down.weight", 0);
-        if (L.k != L.q + (size_t) m.D * m.D * 2 || L.v != L.k + (size_t) m.D * m.D * 2 || L.up != L.g + (size_t) m.F * m.D * 2)
+        const size_t ig = items.size();
+        L.g = add(p + "ffn_gate.weight", k8);
+        L.up = add(p + "ffn_up.weight", k8);
+        const size_t id = items.size();
+        L.d = add(p + "ffn_down.weight", k8);
+        const size_t es = m.i8 ? 1 : 2;
+        if (L.k != L.q + (size_t) m.D * m.D * es || L.v != L.k + (size_t) m.D * m.D * es || L.up != L.g + (size_t) m.F * m.D * es)
             throw std::runtime_error("mmproj: unexpected matrix sizes (q/k/v must be D x D, gate/up F x D)");
+        if (m.i8) {   // the row scales of the fused matrices back to back: [q | k | v], [gate | up], [down]
+            L.sqkv = reserve((size_t) 3 * m.D * 4);
+            L.sgu = reserve((size_t) 2 * m.F * 4);
+            L.sd = reserve((size_t) m.D * 4);
+            for (int j = 0; j < 3; ++j) items[iq + j].soff = L.sqkv + (size_t) j * m.D * 4;
+            items[ig].soff = L.sgu;
+            items[ig + 1].soff = L.sgu + (size_t) m.F * 4;
+            items[id].soff = L.sd;
+        }
     }
     ck(cudaMalloc(&m.arena, total), "malloc weights");
     m.arena_bytes = total;
@@ -584,7 +670,32 @@ Vision::Vision(const std::string& path, int tokens, int max_patches) : p_(new Im
             const uint8_t* src = g.tensor_data(*it.ti);
             const size_t elems = it.ti->elements();
             uint8_t* dst = static_cast<uint8_t*>(m.arena) + it.off;
-            if (it.kind == 1) {
+            if (it.kind == 2) {   // per output row: int8 = round(w / s), s = absmax / 127 (rows are the matrix's ne1)
+                const int64_t in = it.ti->shape[0], rows = (int64_t) (elems / in);
+                const uint16_t* b = reinterpret_cast<const uint16_t*>(src);
+                std::vector<int8_t> q(elems);
+                std::vector<float> sc(rows);
+                for (int64_t r = 0; r < rows; ++r) {
+                    float mx = 0.f;
+                    for (int64_t i = 0; i < in; ++i) {
+                        uint32_t u = (uint32_t) b[r * in + i] << 16;
+                        float f;
+                        std::memcpy(&f, &u, 4);
+                        mx = std::max(mx, std::fabs(f));
+                    }
+                    const float s = std::max(mx, 1e-12f) / 127.f, inv = 1.f / s;
+                    sc[r] = s;
+                    for (int64_t i = 0; i < in; ++i) {
+                        uint32_t u = (uint32_t) b[r * in + i] << 16;
+                        float f;
+                        std::memcpy(&f, &u, 4);
+                        q[r * in + i] = (int8_t) std::lrint(std::max(-127.f, std::min(127.f, f * inv)));
+                    }
+                }
+                ck(cudaMemcpy(dst, q.data(), elems, cudaMemcpyHostToDevice), "upload int8");
+                ck(cudaMemcpy(static_cast<uint8_t*>(m.arena) + it.soff, sc.data(), rows * 4, cudaMemcpyHostToDevice),
+                   "upload scales");
+            } else if (it.kind == 1) {
                 std::vector<__half> h(elems);
                 const float* f = reinterpret_cast<const float*>(src);
                 for (size_t i = 0; i < elems; ++i) h[i] = __float2half(f[i]);
@@ -607,6 +718,18 @@ Vision::Vision(const std::string& path, int tokens, int max_patches) : p_(new Im
                             reinterpret_cast<const float*>(at(L.qn)), reinterpret_cast<const float*>(at(L.kn)),
                             reinterpret_cast<const bf16*>(at(L.q)), reinterpret_cast<const bf16*>(at(L.o)),
                             reinterpret_cast<const bf16*>(at(L.g)), reinterpret_cast<const bf16*>(at(L.d))});
+    if (m.i8)
+        for (size_t il = 0; il < lo.size(); ++il) {
+            Impl::Layer& Ly = m.layers[il];
+            const LOff& L = lo[il];
+            Ly.wqkv = Ly.wgu = Ly.wdown = nullptr;   // those matrices exist only as int8
+            Ly.q8qkv = reinterpret_cast<const int8_t*>(at(L.q));
+            Ly.q8gu = reinterpret_cast<const int8_t*>(at(L.g));
+            Ly.q8down = reinterpret_cast<const int8_t*>(at(L.d));
+            Ly.sqkv = reinterpret_cast<const float*>(at(L.sqkv));
+            Ly.sgu = reinterpret_cast<const float*>(at(L.sgu));
+            Ly.sdown = reinterpret_cast<const float*>(at(L.sd));
+        }
 
     // ---- work buffers
     const int N = max_patches;
@@ -619,6 +742,8 @@ Vision::Vision(const std::string& path, int tokens, int max_patches) : p_(new Im
                  b_out = carve((size_t) N * m.n_out * 4), b_hb = carve(N * D * 2), b_ab = carve(N * D * 2),
                  b_fb = carve(N * F * 2), b_q = carve((size_t) m.H * N * Impl::HDP * 2),
                  b_k = carve((size_t) m.H * N * Impl::HDP * 2), b_v = carve((size_t) m.H * N * Impl::HDP * 2);
+    const size_t b_hq = m.i8 ? carve((size_t) N * F) : 0, b_s1 = m.i8 ? carve((size_t) N * 4) : 0,
+                 b_s2 = m.i8 ? carve((size_t) N * 4) : 0;
     ck(cudaMalloc(&m.work, off), "malloc work");
     auto w8 = [&](size_t o) { return static_cast<uint8_t*>(m.work) + o; };
     m.img = w8(b_img);
@@ -634,6 +759,11 @@ Vision::Vision(const std::string& path, int tokens, int max_patches) : p_(new Im
     m.Qh = reinterpret_cast<__half*>(w8(b_q));
     m.Kh = reinterpret_cast<__half*>(w8(b_k));
     m.Vh = reinterpret_cast<__half*>(w8(b_v));
+    if (m.i8) {
+        m.hq = reinterpret_cast<int8_t*>(w8(b_hq));
+        m.sx1 = reinterpret_cast<float*>(w8(b_s1));
+        m.sx2 = reinterpret_cast<float*>(w8(b_s2));
+    }
     weight_bytes_ += off;
     cb(cublasCreate(&m.blas), "create");
     cb(cublasSetStream(m.blas, s_), "stream");
@@ -724,6 +854,12 @@ int Vision::encode_batch(const std::vector<const ImageU8*>& imgs, std::vector<fl
         cb(cublasGemmEx(m.blas, CUBLAS_OP_T, CUBLAS_OP_N, out_d, rows, in_d, &one, W, wt, in_d, X, xt, in_d, &zero, Y,
                         CUDA_R_32F, out_d, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT), what);
     };
+    // W8A8: Y [n][out] int32 = Xq [n][in] . Wq [out][in]^T (scales applied by the consumer kernels)
+    auto gemm8 = [&](const int8_t* W, const int8_t* X, int32_t* Y, int rows, int out_d, int in_d, const char* what) {
+        const int32_t i1 = 1, i0 = 0;
+        cb(cublasGemmEx(m.blas, CUBLAS_OP_T, CUBLAS_OP_N, out_d, rows, in_d, &i1, W, CUDA_R_8I, in_d, X, CUDA_R_8I, in_d,
+                        &i0, Y, CUDA_R_32I, out_d, CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT), what);
+    };
     gemm(m.patch_w, CUDA_R_16F, m.patches, CUDA_R_16F, m.x, N, D, 3 * P * P, "patch");
     add_pos_kernel<<<N, 256, 0, s>>>(m.x, m.pos, m.pos_size, D, ncols, n);
     kcheck("add_pos");
@@ -734,12 +870,19 @@ int Vision::encode_batch(const std::vector<const ImageU8*>& imgs, std::vector<fl
     for (int il = 0; il < nl; ++il) {
         const Impl::Layer& L = m.layers[il];
         m.mark(il, 0, s);
-        rms_bf16_kernel<<<N, 256, 0, s>>>(m.x, L.ln1, m.hb, D, m.eps);
+        if (m.i8)
+            rms_i8_kernel<<<N, 256, D * sizeof(float), s>>>(m.x, L.ln1, m.hq, m.sx1, D, m.eps);
+        else
+            rms_bf16_kernel<<<N, 256, 0, s>>>(m.x, L.ln1, m.hb, D, m.eps);
         m.mark(il, 1, s);
-        gemm(L.wqkv, CUDA_R_16BF, m.hb, CUDA_R_16BF, m.qkv, N, 3 * D, D, "qkv");
+        if (m.i8)
+            gemm8(L.q8qkv, m.hq, reinterpret_cast<int32_t*>(m.qkv), N, 3 * D, D, "qkv8");
+        else
+            gemm(L.wqkv, CUDA_R_16BF, m.hb, CUDA_R_16BF, m.qkv, N, 3 * D, D, "qkv");
         m.mark(il, 2, s);
         vit_qkv_kernel<<<N, 256, 0, s>>>(m.qkv, L.qn, L.kn, m.Qh, m.Kh, m.Vh, n, H, hd, Impl::HDP, ncols, m.eps,
-                                          theta_scale);
+                                          theta_scale, m.i8 ? reinterpret_cast<const int32_t*>(m.qkv) : nullptr,
+                                          m.sx1, L.sqkv);
         kcheck("vit_qkv");
         m.mark(il, 3, s);
         vit_fa2_kernel<Impl::HDP><<<dim3((n + 63) / 64, H, B), 128, 0, s>>>(m.Qh, m.Kh, m.Vh, m.ab, n, H, hd);
@@ -747,16 +890,30 @@ int Vision::encode_batch(const std::vector<const ImageU8*>& imgs, std::vector<fl
         m.mark(il, 4, s);
         gemm(L.wo, CUDA_R_16BF, m.ab, CUDA_R_16BF, m.y, N, D, D, "attn_out");
         m.mark(il, 5, s);
-        add_rms_kernel<<<N, 256, 0, s>>>(m.x, m.y, L.post_attn, D, m.eps);
-        rms_bf16_kernel<<<N, 256, 0, s>>>(m.x, L.ln2, m.hb, D, m.eps);
-        m.mark(il, 6, s);
-        gemm(L.wgu, CUDA_R_16BF, m.hb, CUDA_R_16BF, m.gu, N, 2 * F, D, "gate_up");
-        m.mark(il, 7, s);
-        geglu_quick_kernel<<<nblk((int64_t) N * F), 256, 0, s>>>(m.gu, m.fb, N, F);
-        m.mark(il, 8, s);
-        gemm(L.wdown, CUDA_R_16BF, m.fb, CUDA_R_16BF, m.y, N, D, F, "down");
-        m.mark(il, 9, s);
-        add_rms_kernel<<<N, 256, 0, s>>>(m.x, m.y, L.post_ffn, D, m.eps);
+        add_rms_kernel<<<N, 256, 0, s>>>(m.x, m.y, L.post_attn, D, m.eps, nullptr, nullptr, nullptr);
+        if (m.i8) {
+            rms_i8_kernel<<<N, 256, D * sizeof(float), s>>>(m.x, L.ln2, m.hq, m.sx1, D, m.eps);
+            m.mark(il, 6, s);
+            gemm8(L.q8gu, m.hq, reinterpret_cast<int32_t*>(m.gu), N, 2 * F, D, "gate_up8");
+            m.mark(il, 7, s);
+            geglu_i8_kernel<<<N, 256, F * sizeof(float), s>>>(reinterpret_cast<const int32_t*>(m.gu), m.sx1, L.sgu,
+                                                             m.hq, m.sx2, F);
+            m.mark(il, 8, s);
+            gemm8(L.q8down, m.hq, reinterpret_cast<int32_t*>(m.y), N, D, F, "down8");
+            m.mark(il, 9, s);
+            add_rms_kernel<<<N, 256, 0, s>>>(m.x, m.y, L.post_ffn, D, m.eps, reinterpret_cast<const int32_t*>(m.y),
+                                             m.sx2, L.sdown);
+        } else {
+            rms_bf16_kernel<<<N, 256, 0, s>>>(m.x, L.ln2, m.hb, D, m.eps);
+            m.mark(il, 6, s);
+            gemm(L.wgu, CUDA_R_16BF, m.hb, CUDA_R_16BF, m.gu, N, 2 * F, D, "gate_up");
+            m.mark(il, 7, s);
+            geglu_quick_kernel<<<nblk((int64_t) N * F), 256, 0, s>>>(m.gu, m.fb, N, F);
+            m.mark(il, 8, s);
+            gemm(L.wdown, CUDA_R_16BF, m.fb, CUDA_R_16BF, m.y, N, D, F, "down");
+            m.mark(il, 9, s);
+            add_rms_kernel<<<N, 256, 0, s>>>(m.x, m.y, L.post_ffn, D, m.eps, nullptr, nullptr, nullptr);
+        }
         kcheck("layer");
         m.mark(il, 10, s);
     }

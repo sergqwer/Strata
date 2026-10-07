@@ -25,6 +25,8 @@
 //                       [--mtp mtp.gguf --draft 3] [--max-queue N] [--slots N] [--mtp-slots M]
 //                       [--prefix-cache-mb 0] [--prefix-max-tokens 768]
 // --max-image-tokens sizes the vision work buffers for the largest per-request "image_tokens" (~90 KB a patch).
+// --vision-int8: the vision encoder's q/k/v, gate/up and down matrices as per-row int8, their GEMMs on the int8 tensor
+//                cores with per-patch activation scales (W8A8); ~1/3 off those GEMMs, accuracy equal on 416 held-out tasks.
 #include "strata/gemma/engine.hpp"
 #include "strata/gemma/image.hpp"
 #include "strata/gemma/model.hpp"
@@ -605,6 +607,7 @@ int main(int argc, char** argv) {
     int n_draft = 3, max_queue = 0, slots = 1, mtp_slots = 1, prefix_tokens = 768;
     long long prefix_mb = 0;
     int port = 8091, ctx = 4096, batch = 2048, img_tokens = 280, max_img_tokens = 280;
+    bool vision_int8 = false;   // --vision-int8: the encoder's q/k/v, gate/up, down GEMMs as W8A8 (int8 tensor cores)
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() {
@@ -623,6 +626,7 @@ int main(int argc, char** argv) {
         else if (a == "--batch" || a == "-b") batch = std::stoi(next());
         else if (a == "--image-tokens") img_tokens = std::stoi(next());
         else if (a == "--max-image-tokens") max_img_tokens = std::stoi(next());
+        else if (a == "--vision-int8") vision_int8 = true;
         else if (a == "--slots") slots = std::max(1, std::stoi(next()));
         else if (a == "--mtp-slots") mtp_slots = std::max(0, std::stoi(next()));
         else if (a == "--mtp") mtp_path = next();
@@ -663,7 +667,7 @@ int main(int argc, char** argv) {
         S.vocab = llama_model_get_vocab(S.vocab_model);
         S.model = Model::load(model_path);
         if (!mmproj.empty()) {
-            S.vision.reset(new Vision(mmproj, img_tokens, std::max(4096, max_img_tokens * 9)));  // 3x3 patches a token
+            S.vision.reset(new Vision(mmproj, img_tokens, std::max(4096, max_img_tokens * 9), vision_int8));  // 3x3 patches a token
             std::fprintf(stderr, "vision: %s, %.2f GiB on the GPU\n", mmproj.c_str(), S.vision->weight_bytes() / 1073741824.0);
         }
         S.n_draft = n_draft;
