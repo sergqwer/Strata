@@ -109,7 +109,7 @@ void decode_layer(const Config& c, const Layer& L, const float* freq, __half* kc
     const int32_t* lo = L.swa ? b.lo : b.lo + b.max_batch;
     const int32_t* hi = L.swa ? b.hi : b.hi + b.max_batch;
     k::attn_partials2(b.q, kc, vc, lo, hi, b.att_scratch, 1, L.n_head, L.n_head_kv, L.head_dim, b.n_split, s);
-    k::attn_combine_quant(b.att_scratch, b.att, b.xq, 1, L.n_head, L.head_dim, b.n_split, s);
+    k::attn_combine_quant2(b.att_scratch, b.att, b.xq, 1, L.n_head, L.head_dim, b.n_split, s);
     native_mmvq(L.wo.type, L.wo.d, b.xq, b.y, qd, D, 1, s);
 
     const bool moe = L.moe();

@@ -1411,7 +1411,71 @@ __global__ void __launch_bounds__(ATT_WARPS * 32) attn_decode2_kernel(const floa
     }
 }
 
+// attn_combine_quant_kernel's results: the row values and the split statistics loaded at once by all threads (the
+// old kernel's thread 0 walked the splits' m and l one load after another before anyone could start); the same
+// arithmetic: M the max of m over splits with l > 0, w = expf(m - M) (0 where l <= 0), L = fma(l, w, L) in split
+// order, v = fma(w, p, v) over the splits with w != 0 in order, v * (1 / L). n_split <= MAXS.
+template <int MAXS>
+__global__ void attn_combine_quant2_kernel(const float* __restrict__ part, float* __restrict__ out, Q81* __restrict__ xq,
+                                           int n_head, int n_split, int hd) {
+    const int h = blockIdx.x, t = blockIdx.y;
+    const float* p = part + ((size_t) t * n_head + h) * n_split * (hd + 2);
+    __shared__ float w[MAXS], lsh[MAXS];
+    __shared__ float Ls;
+    const int e = threadIdx.x;   // blockDim.x == hd
+    float pv[MAXS];
+#pragma unroll
+    for (int s = 0; s < MAXS; ++s) pv[s] = s < n_split ? p[s * (hd + 2) + 2 + e] : 0.f;
+    if (threadIdx.x < 32) {
+        static_assert(MAXS <= 32, "one warp holds the splits");
+        const int s = threadIdx.x;
+        const float ms = s < n_split ? p[s * (hd + 2)] : -INFINITY;
+        const float ls = s < n_split ? p[s * (hd + 2) + 1] : 0.f;
+        const float M = warp_max(ls > 0.f ? ms : -INFINITY);
+        if (s < n_split) {
+            w[s] = ls > 0.f ? expf(ms - M) : 0.f;
+            lsh[s] = ls;
+        }
+        __syncwarp();
+        if (s == 0) {
+            float L = 0.f;
+            for (int q = 0; q < n_split; ++q) L = __fmaf_rn(lsh[q], w[q], L);
+            Ls = L > 0.f ? 1.f / L : 0.f;
+        }
+    }
+    __syncthreads();
+    float v = 0.f;
+#pragma unroll
+    for (int s = 0; s < MAXS; ++s)
+        if (s < n_split && w[s] != 0.f) v = __fmaf_rn(w[s], pv[s], v);
+    v = __fmul_rn(Ls, v);
+    const size_t base = (size_t) t * n_head * hd + (size_t) h * hd;
+    out[base + e] = v;
+    if (xq) {
+        const float amax = warp_max(fabsf(v));
+        const float sum = warp_sum(v);
+        const float d = q8_1_finite(amax / 127.0f);
+        Q81* blk = xq + (base + e) / 32;
+        blk->qs[e % 32] = q8_1_quant(v, d, amax);
+        if (e % 32 == 0) blk->ds = q8_1_ds(d, sum);
+    }
+}
+
 }  // namespace
+
+void attn_combine_quant2(const void* part, float* out, void* xq, int rows, int n_head, int hd, int n_split,
+                         cudaStream_t s) {
+    if (rows <= 0) return;
+    if (glue_off() || n_split > 32 || hd > 1024 || hd % 32) {
+        attn_combine_quant(part, out, xq, rows, n_head, hd, n_split, s);
+        return;
+    }
+    const float* pp = static_cast<const float*>(part);
+    Q81* q = static_cast<Q81*>(xq);
+    if (n_split <= 16) attn_combine_quant2_kernel<16><<<dim3(n_head, rows), hd, 0, s>>>(pp, out, q, n_head, n_split, hd);
+    else attn_combine_quant2_kernel<32><<<dim3(n_head, rows), hd, 0, s>>>(pp, out, q, n_head, n_split, hd);
+    check("attn_combine_quant2");
+}
 
 int g_attn_pf = 1;   // keys loaded ahead per warp: measured 1 (2 the same, 3-4 slower: registers); the harness sets others
 void set_attn_prefetch(int pf) { g_attn_pf = pf; }
@@ -1485,8 +1549,8 @@ void router_gemv2(const float* W, const float* r, float* logits, int n_expert, i
 
 void router_topk2(const float* logits, int n_expert, int k, int rows, int32_t* ids, float* w, cudaStream_t s) {
     if (rows <= 0) return;
-    if (glue_off() || n_expert > 256 || k > 16) {
-        router_topk(logits, n_expert, k, rows, ids, w, s);
+    if (glue_off() || n_expert > 256 || k > 16 || rows > 64) {   // hundreds of rows: the old kernel's shuffles have
+        router_topk(logits, n_expert, k, rows, ids, w, s);       // more throughput (measured at 692 / 1787 rows)
         return;
     }
     router_topk2_kernel<<<nblk(rows, 4), 128, 0, s>>>(logits, n_expert, k, rows, ids, w);

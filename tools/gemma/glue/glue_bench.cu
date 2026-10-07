@@ -592,7 +592,9 @@ static int run_router(const strata::GgufFile& g, int argc, char** argv) {
     for (auto& v : lg) v = 0.5f * ud(rng);
     to_dev(la, lg);
     ogk::router_topk(la, E, K, trials, ia, wa, s);
-    strata::gemma::k::router_topk2(la, E, K, trials, ib, wb, s);
+    for (int t0 = 0; t0 < trials; t0 += 64)   // <= 64 rows a call: the new kernel (more rows take the old one)
+        strata::gemma::k::router_topk2(la + (size_t) t0 * E, E, K, std::min(64, trials - t0), ib + (size_t) t0 * K,
+                                       wb + (size_t) t0 * K, s);
     ck(cudaStreamSynchronize(s), "sync");
     same &= same_bits(ia, ib, (size_t) trials * K * 4, "expert ids (tied logits)", false);
     same &= same_bits(wa, wb, (size_t) trials * K * 4, "expert weights (tied logits)");

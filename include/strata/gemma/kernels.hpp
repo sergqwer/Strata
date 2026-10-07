@@ -161,6 +161,9 @@ void router_topk2(const float* logits, int n_expert, int k, int rows, int32_t* i
 /// moe-glue: attn_partials with each warp's next keys' K / V rows loaded ahead; bitwise the same partials.
 void attn_partials2(const float* q, const __half* kc, const __half* vc, const int32_t* lo, const int32_t* hi,
                     void* scratch, int rows, int n_head, int n_kv, int hd, int n_split, cudaStream_t s);
+/// moe-glue: attn_combine_quant with the split statistics loaded in parallel; bitwise the same (n_split <= 32).
+void attn_combine_quant2(const void* part, float* out, void* xq, int rows, int n_head, int hd, int n_split,
+                         cudaStream_t s);
 /// The harness: keys loaded ahead per warp (1 = default, 2, 3, 4).
 void set_attn_prefetch(int pf);
 
