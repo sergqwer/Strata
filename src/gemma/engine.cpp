@@ -459,8 +459,7 @@ void Engine::layer_big(int il, int n) {
         p.max_rows = rows;
         p.dst = dst;
         p.ld_dst = w.ne[1];
-        if (legacy) mq->run(p, s_);
-        else mq->run_dense(p, s_);   // llama.cpp's tile grid through the faster tile code, bit-identical
+        mq->run(p, s_);
     };
 
     mark(il, 0);

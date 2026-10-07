@@ -355,7 +355,7 @@ int main(int argc, char** argv) {
     int layer = 0;
     std::vector<int> tokens = {692, 917, 1190, 1787};
     std::vector<std::string> dists = {"skew", "uniform"};
-    bool do_moe = true, do_dense = true;
+    bool do_moe = true, do_dense = true, dense_products = true;
     auto split = [](const std::string& s) {
         std::vector<std::string> v;
         size_t a = 0;
@@ -380,13 +380,14 @@ int main(int argc, char** argv) {
         else if (a == "--what") {
             const std::string w = next();
             do_moe = w.find("moe") != std::string::npos;
-            do_dense = w.find("dense") != std::string::npos;
+            do_dense = w.find("dense") != std::string::npos || w.find("mlp") != std::string::npos;
+            dense_products = w.find("dense") != std::string::npos;
         } else if (a == "--reps") g_reps = std::atoi(next().c_str());
         else if (a == "--loop-ms") g_loop_ms = std::atof(next().c_str());
         else if (a == "--check-only") g_check_only = true;
         else if (a == "--vram-mb") g_vram_mb = std::atof(next().c_str());
         else if (a == "--expert-frac") g_frac = std::atoi(next().c_str());
-        else if (a == "--variants") {   // e.g. "u8=0;u8=1;fast=0;c0=96,u8=1"
+        else if (a == "--variants") {   // knob settings, e.g. "jset=0;jset=1;c0=96,jset=1"
             const std::string v = next();
             size_t p0 = 0;
             while (p0 <= v.size()) {
@@ -567,7 +568,33 @@ int main(int argc, char** argv) {
         std::vector<std::string> names = {"attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight",
                                           "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight"};
         std::printf("\n== dense (layer %d)\n", layer);
+        {   // the dense MLP's down input: geglu of gate_ / up_ (n x 2112 each), two kernels vs geglu_quantize
+            const int64_t F = 2112;
+            for (int n : tokens) {
+                const auto hg = activations(n, 2 * F, 31 + n);
+                std::vector<float> hgate((size_t) n * F), hup((size_t) n * F);
+                for (int64_t r = 0; r < n; ++r)
+                    for (int64_t c = 0; c < F; ++c) {
+                        hgate[r * F + c] = hg[r * 2 * F + c];
+                        hup[r * F + c] = hg[r * 2 * F + F + c];
+                    }
+                DevBuf gate((size_t) n * F * 4), up((size_t) n * F * 4), hid((size_t) n * F * 4), xq(mmq::q8_bytes(n, F));
+                ck(cudaMemcpy(gate.p, hgate.data(), hgate.size() * 4, cudaMemcpyHostToDevice), "gate");
+                ck(cudaMemcpy(up.p, hup.data(), hup.size() * 4, cudaMemcpyHostToDevice), "up");
+                const size_t xq_used = (size_t) n * ((F + 511) / 512 * 512) / 128 * 144;
+                auto gq_old = [&] {
+                    k::geglu(gate.as<float>(), up.as<float>(), hid.as<float>(), n, (int) F, F, s);
+                    mmq::quantize(hid.as<float>(), nullptr, xq.p, GGML_TYPE_Q8_0, F, F, n, s);
+                };
+                auto gq_new = [&] { mmq::geglu_quantize(gate.as<float>(), up.as<float>(), F, xq.p, GGML_TYPE_Q8_0, F, n, s); };
+                char lb[64];
+                std::snprintf(lb, sizeof lb, "dense geglu+quantize n=%d", n);
+                compare(lb, run_capture(gq_old, xq.p, xq_used, s), run_capture(gq_new, xq.p, xq_used, s), 1);
+                if (!g_check_only) report(lb, ab(gq_old, gq_new, s), "dense geglu_quantize " + std::to_string(n));
+            }
+        }
         for (const auto& nm : names) {
+            if (!dense_products) break;
             if (gguf_find_tensor(gg.g, (blk + nm).c_str()) < 0) continue;
             Weight w = gg.load(blk + nm);
             for (int n : tokens) {
@@ -580,15 +607,17 @@ int main(int argc, char** argv) {
                 mmq::Product p = product(w, xq.p, b.as<int32_t>(), n, n, out.as<float>(), 1);
                 char label[96];
                 std::snprintf(label, sizeof label, "%s n=%d (%lldx%lld)", nm.c_str(), n, (long long) w.ne1, (long long) w.ne0);
+                // the dense products keep llama.cpp's launch; the tile path is shown for information only: it matches
+                // where llama.cpp tiles, not where its stream-k split sums partials in another order
                 const auto ref = run_capture([&] { mq.run(p, s); }, out.p, (size_t) n * w.ne1 * 4, s);
-                const auto alt = run_capture([&] { mq.run_dense(p, s); }, out.p, (size_t) n * w.ne1 * 4, s);
+                const auto alt = run_capture([&] { mq.run_tiles(p, s); }, out.p, (size_t) n * w.ne1 * 4, s);
                 const char* mode = dense_mode(w.ne1, n, nsm);
-                compare((std::string(label) + " [" + mode + "]").c_str(), ref, alt);
+                compare((std::string(label) + " tiles [llama.cpp: " + mode + "]").c_str(), ref, alt, 4, false);
                 if (!g_check_only) {
-                    const auto r = ab([&] { mq.run(p, s); }, [&] { mq.run_dense(p, s); }, s);
-                    report(label, r, "dense " + nm + " " + std::to_string(n));
+                    const auto r = ab([&] { mq.run(p, s); }, [&] { mq.run_tiles(p, s); }, s);
+                    report(label, r);
                     const double ops = 2.0 * n * w.ne0 * w.ne1 / 1e12;
-                    std::printf("      %.1f -> %.1f TOPS\n", ops / (r.first.med * 1e-3), ops / (r.second.med * 1e-3));
+                    std::printf("      llama.cpp %.1f TOPS, tiles %.1f TOPS\n", ops / (r.first.med * 1e-3), ops / (r.second.med * 1e-3));
                 }
             }
         }

@@ -72,30 +72,24 @@ public:
     Context& operator=(const Context&) = delete;
     /// llama.cpp's launch: a grid of max_rows columns per expert (tiles past an expert's rows exit at once).
     void run(const Product& p, void* stream);
-    /// The MoE product without max_rows: a tile list built on the device from `bounds` (no host sync) - one tile per
-    /// (expert, column block), its width fitted to the expert's rows, no empty tiles - worked off by a persistent
-    /// grid. Every output value is computed by llama.cpp's own tile code over the whole k range in the same order,
-    /// so the result is bit-identical to run(). Types or shapes it does not cover take run() with a host sync.
+    /// The MoE product without max_rows: one persistent launch works off the non-empty (expert, column block) tiles,
+    /// each as wide as its expert's rows need, ordered on the device from `bounds` (no host sync, no empty tiles).
+    /// Every output value is computed by llama.cpp's own tile code over the whole k range in the same order, so the
+    /// result is bit-identical to run(). Types or shapes it does not cover (other than Q4_0 / Q8_0, weight rows not a
+    /// multiple of 128) take run() with a host sync for max_rows.
     void run_tiles(const Product& p, void* stream);
-    /// A dense product (n = 1, max_rows = total_rows) on llama.cpp's own tile grid through the faster tile code, its
-    /// stream-k split mirrored (bit-identical to run()); run() where it is not covered (types other than Q8_0).
-    void run_dense(const Product& p, void* stream);
 
 private:
     void* ctx_ = nullptr;
-    void* items_ = nullptr;     // the device tile list
-    int32_t* ctl_ = nullptr;    // [0] tiles in the list, [1] the work counter
+    int32_t* ctl_ = nullptr;    // run_tiles' work counter and finished-blocks counter (0 between products)
     int32_t* h_bounds_ = nullptr;
     int h_bounds_n_ = 0;
 };
 
-/// Speed knobs (tools/gemma/mmq; the environment sets them at start: STRATA_MMQ_<NAME>). None changes a result bit.
-///   jset: run_tiles' tile widths, 0 = up to 128 columns, 1 = up to 64 (llama.cpp's tile code only)
-///   c0:   a tile's fixed cost in columns, which picks each expert's tile width
-///   fast: 1 = the fast tile code (mmq_fast.cuh), 0 = llama.cpp's tile code for run_tiles / run() for run_dense
-///   u8:   Q4_0 fast tiles with unsigned nibbles and the -8 folded into the accumulator start
+/// run_tiles' speed knobs (tools/gemma/mmq; STRATA_MMQ_JSET / STRATA_MMQ_C0 set them at start); neither changes a
+/// result bit.  "jset": the tile widths, 1 (default) = every width llama.cpp has a tile for from 16 to 128 columns,
+/// 0 = 128/96/64/48/32/16; "c0": a tile's fixed cost in columns (default 128), which picks each expert's tile width.
 void knob(const char* name, int value);
-void tile_tuning(int jset, int c0);
 
 /// dst[i] = i on the device (an identity row table for dense products).
 void iota(int32_t* dst, int64_t n, void* stream);
