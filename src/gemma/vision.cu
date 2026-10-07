@@ -2,12 +2,14 @@
 #include "strata/gemma/vision.hpp"
 
 #include "strata/artifact/gguf_reader.hpp"
+#include "vision_gemm.cuh"
 
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <mma.h>
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -567,6 +569,7 @@ struct Vision::Impl {
     __half *Qh = nullptr, *Kh = nullptr, *Vh = nullptr;
     void* work = nullptr;
     cublasHandle_t blas = nullptr;
+    VisionGemm gt;   // the bf16 / f16 GEMMs with the algorithm tuned per shape (vision_gemm.cuh)
     cudaEvent_t e0 = nullptr, e1 = nullptr;
     // set_profile: per-layer phase boundaries (kVisPhases + 1 events a layer), milliseconds summed per phase
     bool prof = false;
@@ -771,6 +774,47 @@ Vision::Vision(const std::string& path, int tokens, int max_patches, bool int8) 
                             (int) FaSmem<Impl::HDP>::total), "fa smem");
     ck(cudaEventCreate(&m.e0), "event");
     ck(cudaEventCreate(&m.e1), "event");
+
+    // ---- the GEMM algorithms (vision_gemm.cuh): timed once per shape on synthetic encodes (layer 0 only) at the
+    // row counts production sends - video frames at 70 tokens (30 x 21 patches) in batches of 1..max (630..5040 rows;
+    // a 480 x 320 scene at 560 tokens, 81 x 54 = 4374 rows, takes 4410's choice: the same 35 row tiles of 128), a drag
+    // piece at 70 (24 x 24) and a 110 x 110 reference at 560 (69 x 69); other row counts take the nearest tuned one.
+    // STRATA_VIT_GEMM_TUNE=0: cublasGemmEx's default everywhere, as before; STRATA_VIT_GEMM_LOG=1 lists the choices;
+    // STRATA_VIT_GEMM_MAX_GMAC: the largest GEMM tuned, in 1e9 multiply-adds (default 13, see vision_gemm.cuh).
+    m.gt.init(m.blas, s_);
+    const char* tune_env = std::getenv("STRATA_VIT_GEMM_TUNE");
+    m.gt.enabled = !(tune_env && tune_env[0] == '0');
+    if (const char* g = std::getenv("STRATA_VIT_GEMM_MAX_GMAC")) m.gt.max_macs = std::atof(g) * 1e9;
+    if (m.gt.enabled) {
+        struct Grid { int cols, rows, frames; };
+        std::vector<Grid> grids;
+        for (int b = 1; b * 630 <= N; ++b) grids.push_back({30, 21, b});
+        grids.push_back({24, 24, 1});
+        grids.push_back({69, 69, 1});
+        const auto t0 = std::chrono::steady_clock::now();
+        m.gt.tuning = true;
+        std::vector<float> emb;
+        uint32_t seed = 12345u;
+        for (const Grid& gr : grids) {
+            if (gr.cols * gr.rows * gr.frames > N) continue;
+            ImageU8 img;
+            img.nx = gr.cols * m.P;
+            img.ny = gr.rows * m.P;
+            img.rgb.resize((size_t) img.nx * img.ny * 3);
+            for (uint8_t& v : img.rgb) {
+                seed = seed * 1664525u + 1013904223u;
+                v = (uint8_t) (seed >> 24);
+            }
+            emb.clear();
+            encode_batch(std::vector<const ImageU8*>(gr.frames, &img), emb);
+        }
+        m.gt.tuning = false;
+        std::fprintf(stderr, "vision: %d GEMM shapes tuned in %.0f ms (%.0f ms timing); one call each: cuBLAS default "
+                     "%.2f ms -> %.2f ms\n", m.gt.n_tuned,
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
+                     m.gt.tune_ms, m.gt.ms_default, m.gt.ms_chosen);
+        if (const char* lg = std::getenv("STRATA_VIT_GEMM_LOG"); lg && lg[0] == '1') std::fputs(m.gt.summary().c_str(), stderr);
+    }
 }
 
 Vision::~Vision() {
@@ -847,12 +891,10 @@ int Vision::encode_batch(const std::vector<const ImageU8*>& imgs, std::vector<fl
                            cudaMemcpyHostToDevice, s), "image upload");
     patchify_kernel<<<N, 256, 0, s>>>(m.img, img.nx, P, ncols, m.patches, n);
     kcheck("patchify");
-    const float one = 1.f, zero = 0.f;
-    // Y [n][out] = X [n][in] . W [out][in]^T
-    auto gemm = [&](const void* W, cudaDataType wt, const void* X, cudaDataType xt, float* Y, int rows, int out_d, int in_d,
-                    const char* what) {
-        cb(cublasGemmEx(m.blas, CUBLAS_OP_T, CUBLAS_OP_N, out_d, rows, in_d, &one, W, wt, in_d, X, xt, in_d, &zero, Y,
-                        CUDA_R_32F, out_d, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT), what);
+    // Y [n][out] (f32, or yt) = X [n][in] . W [out][in]^T, FP32 accumulation, the algorithm tuned for the shape
+    auto gemm = [&](const void* W, cudaDataType wt, const void* X, cudaDataType xt, void* Y, int rows, int out_d, int in_d,
+                    const char* what, cudaDataType yt = CUDA_R_32F) {
+        m.gt.run(W, wt, X, xt, Y, yt, rows, out_d, in_d, what);
     };
     // W8A8: Y [n][out] int32 = Xq [n][in] . Wq [out][in]^T (scales applied by the consumer kernels)
     auto gemm8 = [&](const int8_t* W, const int8_t* X, int32_t* Y, int rows, int out_d, int in_d, const char* what) {
@@ -865,7 +907,8 @@ int Vision::encode_batch(const std::vector<const ImageU8*>& imgs, std::vector<fl
     kcheck("add_pos");
     float theta_scale = powf(m.theta, -2.0f / (float) (hd / 2));
     if (std::getenv("STRATA_VIT_SWAPXY")) theta_scale = -theta_scale;
-    const int nl = (int) m.layers.size();
+    // tuning encodes (the constructor) need only layer 0: every layer has the same GEMM shapes
+    const int nl = m.gt.tuning ? std::min(1, (int) m.layers.size()) : (int) m.layers.size();
     m.mark(nl, 0, s);   // the patch embedding: from here to layer 0's first mark
     for (int il = 0; il < nl; ++il) {
         const Impl::Layer& L = m.layers[il];

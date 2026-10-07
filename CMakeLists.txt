@@ -69,7 +69,7 @@ add_library(strata_gemma STATIC
 target_include_directories(strata_gemma PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/third_party/ggml ${STRATA_LLAMA_DIR}/vendor)
 target_compile_options(strata_gemma PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${STRATA_CUDA_FLAGS}>)
-target_link_libraries(strata_gemma PUBLIC strata_mmq CUDA::cudart CUDA::cublas)
+target_link_libraries(strata_gemma PUBLIC strata_mmq CUDA::cudart CUDA::cublas CUDA::cublasLt)
 
 add_executable(strata-gemma-parity src/gemma/parity_main.cpp)
 target_link_libraries(strata-gemma-parity PRIVATE strata_gemma)
