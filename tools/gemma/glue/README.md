@@ -21,6 +21,11 @@ flock /root/sg-tools/gpu.lock ./glue_bench $M prompt 692 masses_l0.txt   # promp
 ./prof.sh p692 $M prompt 692 masses_l0.txt prof                  # the same as graphs under nsys
 ```
 
+`mmq_order` (`./build.sh mmq_order`, links the engine build's `libstrata_mmq.a`) runs the old expert sort twice on the
+same ids - its atomics place most rows differently each time - and the real MMQ gate_up of one layer on both orders:
+0 of 5536 (692 rows) and 0 of 14296 (1787 rows) (token, slot) rows differ, 6 trials each, so the prompt path's
+results do not depend on the sort's order (the old code is run-to-run deterministic there).
+
 `masses_l*.txt` (from `routing_masses.py` and `/root/sg-tools/routing-26b.json`) give the skewed per-expert routing:
 logits = log(mass) + Gumbel noise. `prof.sh` runs `glue_bench` under `nsys --cuda-graph-trace=node` and
 `nsys_graphs.py` prints per graph the replay span and kernel time (min / p25 / median; `KERNELS=--kernels` per kernel).
