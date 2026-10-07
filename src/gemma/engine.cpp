@@ -129,6 +129,8 @@ Engine::Engine(const Model& m, int ctx, int max_batch) : m_(m), ctx_(ctx), max_b
         hi_ = carve<int32_t>(2 * N);
         spans_ = carve<int32_t>(256);
         logits_ = carve<float>((size_t) c.n_vocab * kSmall);
+        head_w_ = carve<uint8_t>((size_t) kHeadRows * m.tok_embd.nb1);
+        head_ids_dev_ = carve<int32_t>(kHeadRows);
         amax_ = carve<int32_t>(kSmall);
         hnorm_ = carve<float>((size_t) kSmall * D);
         groups_ = carve<uint8_t>(strata::kernels::native_mmvq_groups_bytes());
@@ -147,7 +149,7 @@ Engine::Engine(const Model& m, int ctx, int max_batch) : m_(m), ctx_(ctx), max_b
     h_logits_.resize(c.n_vocab);
     h_amax_.resize(kSmall);
     n_split_ = (ctx + 127) / 128;
-    graph_exec_.assign((kSmall + 1) * 3, nullptr);
+    graph_exec_.assign((kSmall + 1) * 3 * 2, nullptr);
     if (const char* e = std::getenv("STRATA_NO_GRAPH")) graphs_ = std::string(e) != "1";
     ck(cudaStreamSynchronize(s_), "init");
 }
@@ -175,12 +177,26 @@ const float* Engine::hidden_dev(int i) const {
 const float* Engine::logits_host(int i) {
     if (i < 0) i = n_scored_ - 1;
     if (i != logits_row_) {
-        ck(cudaMemcpyAsync(h_logits_.data(), logits_ + (size_t) i * m_.cfg.n_vocab, (size_t) m_.cfg.n_vocab * sizeof(float),
+        ck(cudaMemcpyAsync(h_logits_.data(), logits_ + (size_t) i * head_rows(), (size_t) head_n() * sizeof(float),
                            cudaMemcpyDeviceToHost, s_), "logits");
         ck(cudaStreamSynchronize(s_), "logits");
         logits_row_ = i;
     }
     return h_logits_.data();
+}
+
+void Engine::set_head_rows(const std::vector<int32_t>& ids) {
+    if (ids.size() > (size_t) kHeadRows) throw std::runtime_error("set_head_rows: more than kHeadRows rows");
+    if (ids == head_ids_) return;
+    head_ids_ = ids;
+    logits_row_ = -1;
+    if (ids.empty()) return;
+    // padded with the last id: argmax takes the first of equal values, so a padding row never wins over its original
+    std::vector<int32_t> pad(kHeadRows, ids.back());
+    std::copy(ids.begin(), ids.end(), pad.begin());
+    ck(cudaMemcpyAsync(head_ids_dev_, pad.data(), kHeadRows * sizeof(int32_t), cudaMemcpyHostToDevice, s_), "head ids");
+    k::gather_rows(m_.tok_embd.d, m_.tok_embd.nb1, head_ids_dev_, kHeadRows, head_w_, s_);
+    ck(cudaStreamSynchronize(s_), "head rows");   // `pad` is pageable host memory and goes out of scope
 }
 
 size_t Engine::kv_row_bytes() const {
@@ -240,7 +256,7 @@ void Engine::forward(const Batch& b, Logits mode) {
     const int32_t dense_bounds[2] = {0, n};
     ck(cudaMemcpyAsync(ptrs_, dense_bounds, sizeof dense_bounds, cudaMemcpyHostToDevice, s_), "bounds");
     if (small) {   // the decode path: a captured graph per (rows, logits mode)
-        const int gi = n * 3 + (int) mode;
+        const int gi = (n * 3 + (int) mode) * 2 + (head_ids_.empty() ? 0 : 1);
         if (graphs_) {
             if (!graph_exec_[gi]) {
                 cudaGraph_t g;
@@ -319,9 +335,10 @@ void Engine::run_small(int n, Logits mode) {
     // xq_ holds q8_1(rms(x) * output_norm) of every row
     const int rows = mode == Logits::All ? n : 1;
     const void* xq = static_cast<const uint8_t*>(xq_) + (size_t) (mode == Logits::All ? 0 : n - 1) * (c.n_embd / 32) * 36;
-    native_mmvq(m_.tok_embd.type, m_.tok_embd.d, xq, logits_, c.n_embd, c.n_vocab, rows, s_);
-    k::softcap(logits_, (int64_t) c.n_vocab * rows, c.softcap, s_);
-    k::argmax_rows(logits_, c.n_vocab, rows, amax_, s_);
+    const int hv = head_rows();
+    native_mmvq(m_.tok_embd.type, head_ids_.empty() ? m_.tok_embd.d : head_w_, xq, logits_, c.n_embd, hv, rows, s_);
+    k::softcap(logits_, (int64_t) hv * rows, c.softcap, s_);
+    k::argmax_rows(logits_, hv, rows, amax_, s_);
 }
 
 // ---------------------------------------------------------------------------------------------- a few rows
@@ -587,9 +604,10 @@ void Engine::head(int row) {
     k::rms_norm(x_ + (size_t) row * c.n_embd, m_.output_norm.f32(), hnorm_, c.n_embd, 1, c.eps, 1.f, s_);
     hrow0_ = 0;
     native_quantize_q8_1(hnorm_, xq_, c.n_embd, 1, s_);
-    native_mmvq(m_.tok_embd.type, m_.tok_embd.d, xq_, logits_, c.n_embd, c.n_vocab, 1, s_);
-    k::softcap(logits_, c.n_vocab, c.softcap, s_);
-    k::argmax_rows(logits_, c.n_vocab, 1, amax_, s_);
+    const int hv = head_rows();
+    native_mmvq(m_.tok_embd.type, head_ids_.empty() ? m_.tok_embd.d : head_w_, xq_, logits_, c.n_embd, hv, 1, s_);
+    k::softcap(logits_, hv, c.softcap, s_);
+    k::argmax_rows(logits_, hv, 1, amax_, s_);
     ck(cudaMemcpyAsync(h_amax_.data(), amax_, sizeof(int32_t), cudaMemcpyDeviceToHost, s_), "argmax");
     ck(cudaStreamSynchronize(s_), "forward");
 }

@@ -7,6 +7,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -60,8 +61,20 @@ public:
     int n_vocab() const { return m_.cfg.n_vocab; }
     /// The scored rows of the last forward: row i in [0, n_scored()).
     int n_scored() const { return n_scored_; }
-    int argmax(int i = -1) const { return h_amax_[i < 0 ? n_scored_ - 1 : i]; }
+    /// The argmax of scored row i, a vocabulary id.
+    int argmax(int i = -1) const {
+        const int a = h_amax_[i < 0 ? n_scored_ - 1 : i];
+        return head_ids_.empty() ? a : head_ids_[std::min<size_t>(a, head_ids_.size() - 1)];
+    }
+    /// Row i's logits on the host: head_n() floats, in head_ids() order (by id when head_ids() is empty).
     const float* logits_host(int i = -1);
+    /// Score only these vocabulary rows (ascending ids, at most kHeadRows) from the next forward on, or every row
+    /// (empty). A grammar that can only ever emit a few hundred tokens needs no more of the 262k-row head (0.6 GB of
+    /// the ~3.3 GB a decode step reads); its constrained choice - the best token it allows - is the same either way.
+    void set_head_rows(const std::vector<int32_t>& ids);
+    const std::vector<int32_t>& head_ids() const { return head_ids_; }
+    int head_n() const { return head_ids_.empty() ? m_.cfg.n_vocab : (int) head_ids_.size(); }
+    static constexpr int kHeadRows = 1024;
     const float* logits_dev() const { return logits_; }
     /// CUDA graphs for the decode path (default on; STRATA_NO_GRAPH=1 turns them off).
     void set_graphs(bool on) { graphs_ = on; }
@@ -115,7 +128,11 @@ private:
     void *xqf_ = nullptr, *xqg_ = nullptr, *xqh_ = nullptr, *xqe_ = nullptr;
     int n_scored_ = 0, logits_row_ = -1, n_split_ = 1;
     bool graphs_ = true;
-    std::vector<void*> graph_exec_;   // [n * 3 + mode]: cudaGraphExec_t of run_small
+    std::vector<void*> graph_exec_;   // [(n * 3 + mode) * 2 + subset head]: cudaGraphExec_t of run_small
+    std::vector<int32_t> head_ids_;   // set_head_rows: the scored vocabulary rows (empty: all)
+    void* head_w_ = nullptr;          // their head rows gathered back to back, padded to kHeadRows (the last row repeated)
+    int32_t* head_ids_dev_ = nullptr;
+    int head_rows() const { return head_ids_.empty() ? m_.cfg.n_vocab : kHeadRows; }   // rows the head kernels run over
     int n_spans_ = 0;
     size_t xq_bytes_ = 0;
     bool prof_ = false;

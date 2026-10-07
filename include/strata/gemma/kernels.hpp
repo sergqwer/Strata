@@ -135,5 +135,7 @@ void attn_partials(const float* q, const __half* kc, const __half* vc, const int
 
 /// ids[r] = argmax of row r (n values)
 void argmax_rows(const float* x, int64_t n, int rows, int32_t* ids, cudaStream_t s);
+/// dst row r = src row ids[r] (row_bytes each), r in [0, n): a quantized matrix's chosen rows back to back.
+void gather_rows(const void* src, size_t row_bytes, const int32_t* ids, int n, void* dst, cudaStream_t s);
 
 }  // namespace strata::gemma::k

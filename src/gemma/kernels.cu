@@ -1019,4 +1019,19 @@ void argmax_rows(const float* x, int64_t n, int rows, int32_t* ids, cudaStream_t
     check("argmax_rows");
 }
 
+namespace {
+__global__ void gather_rows_kernel(const uint8_t* __restrict__ src, size_t row_bytes, const int32_t* __restrict__ ids,
+                                   uint8_t* __restrict__ dst) {
+    const uint8_t* a = src + (size_t) ids[blockIdx.x] * row_bytes;
+    uint8_t* b = dst + (size_t) blockIdx.x * row_bytes;
+    for (size_t i = threadIdx.x; i < row_bytes; i += blockDim.x) b[i] = a[i];
+}
+}  // namespace
+
+void gather_rows(const void* src, size_t row_bytes, const int32_t* ids, int n, void* dst, cudaStream_t s) {
+    if (n <= 0) return;
+    gather_rows_kernel<<<n, 256, 0, s>>>(static_cast<const uint8_t*>(src), row_bytes, ids, static_cast<uint8_t*>(dst));
+    check("gather_rows");
+}
+
 }  // namespace strata::gemma::k

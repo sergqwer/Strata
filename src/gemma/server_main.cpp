@@ -23,8 +23,11 @@
 //   strata-gemma-server -m model.gguf --mmproj mmproj.gguf [--host 0.0.0.0] [--port 8091] [--api-key-file F]
 //                       [--ctx 4096] [--batch 2048] [--image-tokens 280] [--max-image-tokens 560]
 //                       [--mtp mtp.gguf --draft 3] [--max-queue N] [--slots N] [--mtp-slots M]
-//                       [--prefix-cache-mb 0] [--prefix-max-tokens 768]
+//                       [--prefix-cache-mb 0] [--prefix-max-tokens 768] [--full-head]
 // --max-image-tokens sizes the vision work buffers for the largest per-request "image_tokens" (~90 KB a patch).
+// Under a grammar whose characters are a plain list (the compact answers: digits, spaces, ';', '-', A-H) the head
+// scores only the vocabulary rows made of them (~500 of 262144; 0.6 GB less read a decode step) - the same choice, as
+// the grammar takes the best token it allows. --full-head scores every row anyway.
 // --vision-int8: the vision encoder's q/k/v, gate/up and down matrices as per-row int8, their GEMMs on the int8 tensor
 //                cores with per-patch activation scales (W8A8); ~1/3 off those GEMMs, accuracy equal on 416 held-out tasks.
 #include "strata/gemma/engine.hpp"
@@ -41,6 +44,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bitset>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -204,6 +208,9 @@ struct Server {
     double service_ms = 800.0;         // running average of a request's time on the GPU
     std::atomic<uint64_t> late{0};
     PrefixCache prefix;
+    bool full_head = false;            // --full-head: score every vocabulary row even under a grammar
+    std::mutex head_mu;
+    std::unordered_map<std::string, std::shared_ptr<const std::vector<int32_t>>> head_cache;   // grammar -> its rows
 
     std::vector<llama_token> tokenize(const std::string& text) const {
         std::vector<llama_token> t(text.size() + 8);
@@ -215,12 +222,101 @@ struct Server {
         t.resize(std::max(n, 0));
         return t;
     }
-    std::string piece(llama_token tok) const {
+    std::string piece(llama_token tok, bool special = false) const {
         char buf[256];
-        const int n = llama_token_to_piece(vocab, tok, buf, sizeof buf, 0, false);
+        const int n = llama_token_to_piece(vocab, tok, buf, sizeof buf, 0, special);
         return n > 0 ? std::string(buf, n) : std::string();
     }
 };
+
+// The characters a GBNF grammar can ever match: those of its literals and character classes. False when it can match
+// beyond such a list - a negated class, '.', a token reference - or names a character outside ASCII.
+bool grammar_alphabet(const std::string& g, std::bitset<128>& a) {
+    const size_t n = g.size();
+    size_t i = 0;
+    const auto hexval = [](char c) { return c <= '9' ? c - '0' : (c | 0x20) - 'a' + 10; };
+    // one character at g[i], escaped or not: its code point, i past it
+    const auto chr = [&](uint32_t& c) -> bool {
+        if (i >= n || (unsigned char) g[i] >= 0x80) return false;
+        if (g[i] != '\\') {
+            c = (unsigned char) g[i++];
+            return true;
+        }
+        if (++i >= n) return false;
+        const char e = g[i++];
+        const int digits = e == 'x' ? 2 : e == 'u' ? 4 : e == 'U' ? 8 : 0;
+        if (!digits) {
+            c = e == 't' ? '\t' : e == 'r' ? '\r' : e == 'n' ? '\n' : (unsigned char) e;
+            return c < 0x80;
+        }
+        c = 0;
+        for (int k = 0; k < digits; ++k, ++i) {
+            if (i >= n || !std::isxdigit((unsigned char) g[i])) return false;
+            c = c * 16 + (uint32_t) hexval(g[i]);
+        }
+        return c < 0x80;
+    };
+    while (i < n) {
+        const char ch = g[i];
+        if (ch == '#') {
+            while (i < n && g[i] != '\n') ++i;
+        } else if (ch == '"') {
+            for (++i; i < n && g[i] != '"';) {
+                uint32_t c;
+                if (!chr(c)) return false;
+                a.set(c);
+            }
+            if (i++ >= n) return false;
+        } else if (ch == '[') {
+            if (++i < n && g[i] == '^') return false;
+            while (i < n && g[i] != ']') {
+                uint32_t lo, hi;
+                if (!chr(lo)) return false;
+                hi = lo;
+                if (i + 1 < n && g[i] == '-' && g[i + 1] != ']') {
+                    ++i;
+                    if (!chr(hi)) return false;
+                }
+                for (uint32_t c = lo; c <= hi; ++c) a.set(c);
+            }
+            if (i++ >= n) return false;
+        } else if (ch == '.' || ch == '<') {
+            return false;
+        } else {
+            ++i;
+        }
+    }
+    return true;
+}
+
+// The vocabulary rows a grammar can ever emit: the end-of-generation tokens and every token whose text (as llama.cpp's
+// grammar sampler sees it) is made only of the grammar's characters. Null - the whole head - without a grammar, when
+// its characters are not a plain list, or when more than Engine::kHeadRows tokens qualify. The constrained greedy
+// choice is the best token the grammar allows, so it is the same over these rows as over all of them.
+std::shared_ptr<const std::vector<int32_t>> head_rows_for(Server& S, const std::string& grammar) {
+    if (grammar.empty() || S.full_head) return nullptr;
+    std::lock_guard<std::mutex> l(S.head_mu);
+    if (auto it = S.head_cache.find(grammar); it != S.head_cache.end()) return it->second;
+    std::shared_ptr<const std::vector<int32_t>> rows;
+    std::bitset<128> a;
+    if (grammar_alphabet(grammar, a)) {
+        auto ids = std::make_shared<std::vector<int32_t>>();
+        const int nv = std::min(llama_vocab_n_tokens(S.vocab), S.engines[0]->n_vocab());
+        for (int t = 0; t < nv && ids->size() <= (size_t) Engine::kHeadRows; ++t) {
+            bool ok = llama_vocab_is_eog(S.vocab, t);
+            if (!ok) {
+                const std::string pc = S.piece(t, true);
+                ok = !pc.empty() && pc[0] != 0 &&
+                     std::all_of(pc.begin(), pc.end(), [&](char c) { return (unsigned char) c < 0x80 && a.test((unsigned char) c); });
+            }
+            if (ok) ids->push_back(t);
+        }
+        if (ids->size() <= (size_t) Engine::kHeadRows) rows = ids;
+    }
+    if (S.head_cache.size() >= 256) S.head_cache.clear();   // grammars come from clients: keep the map bounded
+    S.head_cache.emplace(grammar, rows);
+    return rows;
+}
 
 // split on the marker, keeping empty parts (mtmd's split_text)
 std::vector<std::string> split(const std::string& s, const std::string& d) {
@@ -241,6 +337,7 @@ struct Prepared {
     std::vector<std::string> parts;
     std::vector<ImageU8> images;
     std::string grammar;
+    std::shared_ptr<const std::vector<int32_t>> head;   // the vocabulary rows the grammar can emit (null: all)
     int n_predict = 0;
     bool profile = false;   // "profile": true - the prompt path's phase times come back in timings.profile
     int prefix_k = 0;                 // "cache_prefix": the prompt through this many pictures is a shared prefix
@@ -332,6 +429,7 @@ Prepared prepare(Server& S, const json& req) {
     P.pre_ms = now_ms() - t_pre;
     P.parts = parts;
     P.grammar = grammar;
+    P.head = head_rows_for(S, grammar);
     P.n_predict = n_predict;
     P.profile = req.value("profile", false);
     return P;
@@ -362,6 +460,8 @@ json completion(Server& S, Prepared P, int slot) {
     const double t_wait = now_ms();
     std::unique_lock<std::mutex> compute(S.cmu);  // until the prefill is done
     const double cw_ms = now_ms() - t_wait;
+    static const std::vector<int32_t> kAllRows;
+    E.set_head_rows(P.head ? *P.head : kAllRows);
     // the pictures through the vision encoder first, consecutive ones of one size (video frames) a batch at a time;
     // their embeddings land in b.embd in picture order, as the prompt takes them
     std::vector<int> vis_n(images.size(), 0);
@@ -456,7 +556,6 @@ json completion(Server& S, Prepared P, int slot) {
         if (!gs) throw std::runtime_error("invalid grammar");
     }
     std::unique_ptr<llama_sampler, void (*)(llama_sampler*)> gs_guard(gs, [](llama_sampler* x) { if (x) llama_sampler_free(x); });
-    const int n_vocab = E.n_vocab();
     std::vector<llama_token_data> cand;
     std::string content;
     int n_gen = 0, n_drafted = 0, n_accepted = 0, n_windows = 0;
@@ -470,13 +569,19 @@ json completion(Server& S, Prepared P, int slot) {
         llama_sampler_apply(gs, &arr);
         if (std::isfinite(arr.data[0].logit)) return best;
         const float* lg = E.logits_host(r);   // the argmax breaks the grammar: the best token that does not
-        cand.resize(n_vocab);
-        for (int v = 0; v < n_vocab; ++v) cand[v] = {v, lg[v], 0.f};
+        const std::vector<int32_t>& ids = E.head_ids();   // the scored rows (empty: all, by id)
+        const int m = E.head_n();
+        cand.resize(m);
+        for (int v = 0; v < m; ++v) cand[v] = {ids.empty() ? v : ids[v], lg[v], 0.f};
         llama_token_data_array all{cand.data(), cand.size(), -1, false};
         llama_sampler_apply(gs, &all);
         best = -1;
+        float best_logit = -INFINITY;
         for (size_t i = 0; i < all.size; ++i)
-            if (std::isfinite(all.data[i].logit) && (best < 0 || all.data[i].logit > lg[best])) best = all.data[i].id;
+            if (std::isfinite(all.data[i].logit) && (best < 0 || all.data[i].logit > best_logit)) {
+                best = all.data[i].id;
+                best_logit = all.data[i].logit;
+            }
         return best;
     };
     const double t_tg = now_ms();
@@ -555,6 +660,7 @@ json completion(Server& S, Prepared P, int slot) {
                   {"compute_wait_ms", cw_ms},
                   {"profile", prof},
                   {"images", n_images},
+                  {"head_rows", E.head_n()},
                   {"prefix_n", (int) prefix_end},
                   {"prefix_cached", saved ? 1 : 0},
                   {"prefill_ms", pp_ms},
@@ -584,16 +690,25 @@ void warmup(Server& S, int slot) {
     b.tokens.push_back(llama_vocab_bos(S.vocab));
     while (b.tokens.size() < 48)
         for (llama_token t : S.tokenize("warm up the engine ")) b.tokens.push_back(t);
-    E.reset();
-    E.forward(b, true);
-    const int base = E.n_past();
     std::vector<int32_t> drafts;
-    for (int n = 1; n <= Engine::kSmall; ++n) {
-        E.truncate(base);
-        Batch w;
-        w.tokens.assign(n, b.tokens[1]);
-        E.forward(w, Engine::Logits::All);
+    int base = 0;
+    const auto digits = head_rows_for(S, "root ::= [0-9]+");   // a grammar's subset head has graphs of its own
+    for (const std::vector<int32_t>* head : {(const std::vector<int32_t>*) nullptr, digits.get()}) {
+        if (head) E.set_head_rows(*head);
+        E.reset();
+        E.forward(b, true);
+        base = E.n_past();
+        for (int n = 1; n <= Engine::kSmall; ++n) {
+            E.truncate(base);
+            Batch w;
+            w.tokens.assign(n, b.tokens[1]);
+            E.forward(w, Engine::Logits::All);
+        }
+        E.set_head_rows({});
     }
+    E.reset();
+    E.forward(b, true);   // the MTP warm-up drafts from this hidden state
+    base = E.n_past();
     if (mtp)
         for (int n = 1; n <= std::min(S.n_draft, mtp->max_draft()); ++n) mtp->draft(b.tokens[1], base, E.hidden_dev(0), n, drafts);
     E.reset();
@@ -607,6 +722,7 @@ int main(int argc, char** argv) {
     int n_draft = 3, max_queue = 0, slots = 1, mtp_slots = 1, prefix_tokens = 768;
     long long prefix_mb = 0;
     int port = 8091, ctx = 4096, batch = 2048, img_tokens = 280, max_img_tokens = 280;
+    bool full_head = false;     // --full-head: no grammar-subset head (for A/B)
     bool vision_int8 = false;   // --vision-int8: the encoder's q/k/v, gate/up, down GEMMs as W8A8 (int8 tensor cores)
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -627,6 +743,7 @@ int main(int argc, char** argv) {
         else if (a == "--image-tokens") img_tokens = std::stoi(next());
         else if (a == "--max-image-tokens") max_img_tokens = std::stoi(next());
         else if (a == "--vision-int8") vision_int8 = true;
+        else if (a == "--full-head") full_head = true;
         else if (a == "--slots") slots = std::max(1, std::stoi(next()));
         else if (a == "--mtp-slots") mtp_slots = std::max(0, std::stoi(next()));
         else if (a == "--mtp") mtp_path = next();
@@ -647,6 +764,7 @@ int main(int argc, char** argv) {
     S.ctx = ctx;
     S.batch = batch;
     S.max_queue = max_queue;
+    S.full_head = full_head;
     S.model_name = model_path.substr(model_path.find_last_of('/') + 1);
     if (!key_file.empty()) {
         std::ifstream kf(key_file);
